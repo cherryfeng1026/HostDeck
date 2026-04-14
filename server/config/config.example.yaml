@@ -1,0 +1,13 @@
+http_addr: ":18080"
+db_driver: "postgres"
+db_dsn: "postgresql://user:password@localhost:5432/hostdeck?sslmode=require"
+bootstrap_admin_username: ""
+bootstrap_admin_password: ""
+bootstrap_admin_token: ""
+master_key: "change-me"
+session_cookie_name: "hostdeck_session"
+session_cookie_secure: false
+session_ttl_hours: 24
+web_dist_dir: "../../web/dist"
+poll_interval_seconds: 60
+poll_concurrency: 5
