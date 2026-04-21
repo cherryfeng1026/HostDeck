@@ -7,11 +7,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"hostdeck/server/internal/api"
 	"hostdeck/server/internal/domain"
@@ -19,14 +18,15 @@ import (
 	"hostdeck/server/internal/service"
 	"hostdeck/server/internal/sshx"
 	"hostdeck/server/internal/storage"
+	"hostdeck/server/internal/testsupport"
 )
 
 type fakeCommandRunner struct {
-	mu           sync.Mutex
-	targets       []sshx.Target
-	errorByHost   map[string]error
-	stdoutByHost  map[string]string
-	stderrByHost  map[string]string
+	mu             sync.Mutex
+	targets        []sshx.Target
+	errorByHost    map[string]error
+	stdoutByHost   map[string]string
+	stderrByHost   map[string]string
 	exitCodeByHost map[string]int
 }
 
@@ -51,20 +51,7 @@ func (f *fakeCommandRunner) Run(ctx context.Context, target sshx.Target, command
 
 func openCommandTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-
-	db, err := sql.Open("sqlite", "file:command-handler-test?mode=memory&cache=shared")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := storage.Migrate(context.Background(), db); err != nil {
-		t.Fatalf("migrate db: %v", err)
-	}
-
-	return db
+	return testsupport.OpenPostgresTestDB(t)
 }
 
 func seedCommandServer(t *testing.T, repo *storage.ServerRepository) {
@@ -126,7 +113,7 @@ func TestExecuteCommand_StoresLog(t *testing.T) {
 	runner := &fakeCommandRunner{}
 
 	svc := service.NewCommandService(connectionService, runner, logRepo)
-	result, err := svc.Execute(context.Background(), 1, "df -h", 15*time.Second)
+	result, err := svc.ExecuteWithExecutor(context.Background(), 1, "df -h", 15*time.Second, "operator")
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -147,12 +134,16 @@ func TestExecuteCommand_StoresLog(t *testing.T) {
 	if len(logs) != 1 {
 		t.Fatalf("expected 1 command log, got %d", len(logs))
 	}
+	if logs[0].ExecutorUsername != "operator" {
+		t.Fatalf("expected executor username to persist, got %+v", logs[0])
+	}
 }
 
 func TestCommandRoutes_ExecuteReturnsResult(t *testing.T) {
 	db := openCommandTestDB(t)
 	serverRepo := storage.NewServerRepository(db, "test-master-key")
 	seedCommandServer(t, serverRepo)
+	auditRepo := storage.NewAuditEventRepository(db)
 	commandService := service.NewCommandService(
 		service.NewServerConnectionService(
 			serverRepo,
@@ -164,11 +155,11 @@ func TestCommandRoutes_ExecuteReturnsResult(t *testing.T) {
 	)
 
 	router := httpx.NewRouterWithHandlers(
-		api.NewServerHandler(serverRepo, nil),
+		api.NewServerHandler(serverRepo, nil, auditRepo),
 		nil,
 		nil,
 		nil,
-		api.NewCommandHandler(commandService),
+		api.NewCommandHandler(commandService, auditRepo),
 		nil,
 	)
 
@@ -192,6 +183,20 @@ func TestCommandRoutes_ExecuteReturnsResult(t *testing.T) {
 	if result.Command != "df -h" || result.ExitCode != 0 {
 		t.Fatalf("unexpected command result: %+v", result)
 	}
+
+	audits, err := auditRepo.ListRecent(context.Background(), 10, "")
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	if len(audits) != 1 {
+		t.Fatalf("expected 1 audit event, got %d", len(audits))
+	}
+	if audits[0].Kind != domain.AuditKindCommand || audits[0].Title != "执行命令" {
+		t.Fatalf("unexpected audit event: %+v", audits[0])
+	}
+	if audits[0].ServerID != 1 || !strings.Contains(audits[0].Summary, "df -h") {
+		t.Fatalf("unexpected audit payload: %+v", audits[0])
+	}
 }
 
 func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
@@ -199,6 +204,7 @@ func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
 	serverRepo := storage.NewServerRepository(db, "test-master-key")
 	seedCommandServer(t, serverRepo)
 	logRepo := storage.NewCommandLogRepository(db)
+	auditRepo := storage.NewAuditEventRepository(db)
 	runner := &fakeCommandRunner{
 		errorByHost: map[string]error{
 			"10.0.0.22": context.DeadlineExceeded,
@@ -219,11 +225,11 @@ func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
 	)
 
 	router := httpx.NewRouterWithHandlers(
-		api.NewServerHandler(serverRepo, nil),
+		api.NewServerHandler(serverRepo, nil, auditRepo),
 		nil,
 		nil,
 		nil,
-		api.NewCommandHandler(commandService),
+		api.NewCommandHandler(commandService, auditRepo),
 		nil,
 	)
 
@@ -283,6 +289,14 @@ func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
 	if len(logs3) != 1 {
 		t.Fatalf("expected 1 log for server 3, got %d", len(logs3))
 	}
+
+	audits, err := auditRepo.ListRecent(context.Background(), 10, "")
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	if len(audits) != 3 {
+		t.Fatalf("expected 3 audit events for concrete servers, got %d", len(audits))
+	}
 }
 
 func TestCommandRoutes_ExecuteReturnsConflictForDisabledServer(t *testing.T) {
@@ -333,5 +347,197 @@ func TestCommandRoutes_ExecuteReturnsConflictForDisabledServer(t *testing.T) {
 
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected status %d, got %d", http.StatusConflict, rec.Code)
+	}
+}
+
+func TestCommandRoutes_ListHistoryReturnsFilteredLogs(t *testing.T) {
+	db := openCommandTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seedCommandServer(t, serverRepo)
+	logRepo := storage.NewCommandLogRepository(db)
+	now := time.Date(2026, 4, 21, 9, 0, 0, 0, time.UTC)
+	if err := logRepo.Create(context.Background(), domain.CommandLog{
+		ServerID:         1,
+		ExecutorUsername: "admin",
+		Command:          "df -h",
+		Stdout:           "ok",
+		Stderr:           "",
+		ExitCode:         0,
+		DurationMS:       120,
+		ExecutedAt:       now,
+	}); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+	if err := logRepo.Create(context.Background(), domain.CommandLog{
+		ServerID:         2,
+		ExecutorUsername: "viewer",
+		Command:          "uptime",
+		Stdout:           "load average",
+		Stderr:           "",
+		ExitCode:         0,
+		DurationMS:       80,
+		ExecutedAt:       now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("create second log: %v", err)
+	}
+
+	commandService := service.NewCommandService(
+		service.NewServerConnectionService(
+			serverRepo,
+			storage.NewServerCredentialRepository(db),
+			"test-master-key",
+		),
+		&fakeCommandRunner{},
+		logRepo,
+	)
+	router := httpx.NewRouterWithHandlers(
+		api.NewServerHandler(serverRepo, nil),
+		nil,
+		nil,
+		nil,
+		api.NewCommandHandler(commandService),
+		nil,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/commands/history?serverId=1&executorUsername=admin&keyword=10.0.0.21&startTime=2026-04-21T08:59:30Z&endTime=2026-04-21T09:00:30Z&limit=10", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var items []domain.CommandLog
+	if err := json.NewDecoder(rec.Body).Decode(&items); err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 history item, got %d", len(items))
+	}
+	if items[0].ServerID != 1 || items[0].ExecutorUsername != "admin" || items[0].Command != "df -h" {
+		t.Fatalf("unexpected history item: %+v", items[0])
+	}
+}
+
+func TestCommandRoutes_ListHistoryRejectsInvalidTimeRange(t *testing.T) {
+	db := openCommandTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seedCommandServer(t, serverRepo)
+	commandService := service.NewCommandService(
+		service.NewServerConnectionService(
+			serverRepo,
+			storage.NewServerCredentialRepository(db),
+			"test-master-key",
+		),
+		&fakeCommandRunner{},
+		storage.NewCommandLogRepository(db),
+	)
+	router := httpx.NewRouterWithHandlers(
+		api.NewServerHandler(serverRepo, nil),
+		nil,
+		nil,
+		nil,
+		api.NewCommandHandler(commandService),
+		nil,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/commands/history?startTime=2026-04-21T09:00:30Z&endTime=2026-04-21T08:59:30Z", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if payload["error"] != "endTime 必须晚于或等于 startTime" {
+		t.Fatalf("unexpected error message: %q", payload["error"])
+	}
+}
+
+func TestCommandRoutes_ListHistoryRejectsNonPositiveNumericFilters(t *testing.T) {
+	db := openCommandTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seedCommandServer(t, serverRepo)
+	commandService := service.NewCommandService(
+		service.NewServerConnectionService(
+			serverRepo,
+			storage.NewServerCredentialRepository(db),
+			"test-master-key",
+		),
+		&fakeCommandRunner{},
+		storage.NewCommandLogRepository(db),
+	)
+	router := httpx.NewRouterWithHandlers(
+		api.NewServerHandler(serverRepo, nil),
+		nil,
+		nil,
+		nil,
+		api.NewCommandHandler(commandService),
+		nil,
+	)
+
+	cases := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{name: "serverId", query: "serverId=-1", wantError: "serverId 必须大于 0"},
+		{name: "limit", query: "limit=0", wantError: "limit 必须大于 0"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/commands/history?"+tc.query, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			var payload map[string]string
+			if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if payload["error"] != tc.wantError {
+				t.Fatalf("unexpected error message: %q", payload["error"])
+			}
+		})
+	}
+}
+
+func TestCommandRoutes_ListTemplatesReturnsSharedTemplates(t *testing.T) {
+	commandService := service.NewCommandService(
+		service.NewServerConnectionService(nil, nil, "test-master-key"),
+		&fakeCommandRunner{},
+		storage.NewCommandLogRepository(openCommandTestDB(t)),
+	)
+	router := httpx.NewRouterWithHandlers(
+		nil,
+		nil,
+		nil,
+		nil,
+		api.NewCommandHandler(commandService),
+		nil,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/commands/templates", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Items []domain.CommandTemplate `json:"items"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode templates: %v", err)
+	}
+	if len(payload.Items) == 0 {
+		t.Fatal("expected command templates")
+	}
+	if payload.Items[0].Scope != domain.CommandTemplateScopeShared {
+		t.Fatalf("expected shared scope, got %+v", payload.Items[0])
 	}
 }

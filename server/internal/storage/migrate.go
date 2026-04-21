@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS command_logs (
     stderr TEXT NOT NULL,
     exit_code INTEGER NOT NULL,
     duration_ms BIGINT NOT NULL,
-    executed_at TEXT NOT NULL
+    executed_at TIMESTAMPTZ NOT NULL
 );
 `
 
@@ -249,6 +249,12 @@ const createCommandLogsExecutorExecutedIndexSQL = `
 CREATE INDEX IF NOT EXISTS idx_command_logs_executor_executed_at ON command_logs (executor_username, executed_at);
 `
 
+const alterCommandLogsExecutedAtToTimestamptzSQL = `
+ALTER TABLE command_logs
+    ALTER COLUMN executed_at TYPE TIMESTAMPTZ
+    USING executed_at::timestamptz;
+`
+
 const createAuditEventsCreatedIndexSQL = `
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events (created_at);
 `
@@ -344,6 +350,12 @@ var schemaMigrations = []migrationStep{
 		version: 9,
 		statements: []string{
 			addServersMaintenanceWindowSQL,
+		},
+	},
+	{
+		version: 10,
+		statements: []string{
+			alterCommandLogsExecutedAtToTimestamptzSQL,
 		},
 	},
 }

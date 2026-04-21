@@ -69,17 +69,28 @@ func NewRouterWithHandlers(
 		api.RegisterServerDetailRoutes(target, detailHandler)
 		api.RegisterServerReadRoutes(target, serverHandler)
 		api.RegisterAlertReadRoutes(target, alertHandler)
+		api.RegisterCommandTemplateRoutes(target, commandHandler)
 		api.RegisterShellRoutes(target, options.shellHandler)
 		if options.authHandler != nil {
-			target.Get("/api/auth/me", options.authHandler.CurrentUser)
-			target.Post("/api/auth/change-password", options.authHandler.ChangePassword)
-			target.With(RequireUserManagementAccess).Get("/api/users", options.authHandler.ListUsers)
+			target.With(RequireSessionAuth).Get("/api/auth/me", options.authHandler.CurrentUser)
+			target.With(RequireSessionAuth).Post("/api/auth/change-password", options.authHandler.ChangePassword)
+			target.With(RequireSessionAuth).Get("/api/auth/api-tokens", options.authHandler.ListAPITokens)
+			target.With(RequireSessionAuth).Post("/api/auth/api-tokens", options.authHandler.CreateAPIToken)
+			target.With(RequireSessionAuth).Delete("/api/auth/api-tokens/{id}", options.authHandler.RevokeAPIToken)
+			target.With(RequireSessionAuth, RequireUserManagementAccess).Group(func(userMgmt chi.Router) {
+				userMgmt.Get("/api/users", options.authHandler.ListUsers)
+				userMgmt.Post("/api/users", options.authHandler.CreateUser)
+				userMgmt.Put("/api/users/{id}", options.authHandler.UpdateUser)
+				userMgmt.Post("/api/users/{id}/reset-password", options.authHandler.ResetUserPassword)
+				userMgmt.Post("/api/users/{id}/revoke-sessions", options.authHandler.RevokeUserSessions)
+			})
 		}
 	}
 	registerManagedProtected := func(target chi.Router) {
 		api.RegisterServerWriteRoutes(target, serverHandler)
 		api.RegisterProbeRoutes(target, probeHandler)
-		api.RegisterCommandRoutes(target, commandHandler)
+		api.RegisterCommandHistoryRoutes(target, commandHandler)
+		api.RegisterCommandWriteRoutes(target, commandHandler)
 		api.RegisterAlertWriteRoutes(target, alertHandler)
 	}
 
