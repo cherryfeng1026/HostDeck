@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"hostdeck/server/internal/authctx"
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/service"
 	"hostdeck/server/internal/storage"
@@ -25,28 +27,40 @@ type LiveServerLister interface {
 	ListLive(ctx context.Context, filter storage.ServerFilter) ([]service.LiveServerItem, error)
 }
 
+type AuditEventWriter interface {
+	Create(ctx context.Context, event domain.AuditEvent) error
+}
+
 type ServerHandler struct {
 	store      ServerStore
 	liveLister LiveServerLister
+	audit      AuditEventWriter
 }
 
 type serverPayload struct {
-	Name          string   `json:"name"`
-	Hostname      string   `json:"hostname"`
-	IP            string   `json:"ip"`
-	SSHPort       int      `json:"sshPort"`
-	Username      string   `json:"username"`
-	AuthType      string   `json:"authType"`
-	Password      string   `json:"password"`
-	CollectorMode string   `json:"collectorMode"`
-	Tags          []string `json:"tags"`
-	Purpose       string   `json:"purpose"`
-	Remark        string   `json:"remark"`
-	Enabled       *bool    `json:"enabled"`
+	Name                      string   `json:"name"`
+	Hostname                  string   `json:"hostname"`
+	IP                        string   `json:"ip"`
+	SSHPort                   int      `json:"sshPort"`
+	Username                  string   `json:"username"`
+	AuthType                  string   `json:"authType"`
+	Password                  string   `json:"password"`
+	TrustedHostKeyFingerprint string   `json:"trustedHostKeyFingerprint"`
+	CollectorMode             string   `json:"collectorMode"`
+	Tags                      []string `json:"tags"`
+	Purpose                   string   `json:"purpose"`
+	Remark                    string   `json:"remark"`
+	MaintenanceStartAt        string   `json:"maintenanceStartAt"`
+	MaintenanceEndAt          string   `json:"maintenanceEndAt"`
+	Enabled                   *bool    `json:"enabled"`
 }
 
-func NewServerHandler(store ServerStore, liveLister LiveServerLister) *ServerHandler {
-	return &ServerHandler{store: store, liveLister: liveLister}
+func NewServerHandler(store ServerStore, liveLister LiveServerLister, audit ...AuditEventWriter) *ServerHandler {
+	handler := &ServerHandler{store: store, liveLister: liveLister}
+	if len(audit) > 0 {
+		handler.audit = audit[0]
+	}
+	return handler
 }
 
 func RegisterServerReadRoutes(r chi.Router, h *ServerHandler) {
@@ -117,6 +131,18 @@ func (h *ServerHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeServerStoreError(w, err)
 		return
 	}
+	if h.audit != nil {
+		user, _ := authctx.CurrentUser(r.Context())
+		_ = h.audit.Create(r.Context(), domain.AuditEvent{
+			Kind:       domain.AuditKindServer,
+			Severity:   "info",
+			Title:      "新增服务器",
+			Summary:    item.Name + " · " + item.IP,
+			ServerName: item.Name,
+			Username:   user.Username,
+			CreatedAt:  time.Now().UTC(),
+		})
+	}
 
 	w.WriteHeader(http.StatusCreated)
 }
@@ -137,6 +163,19 @@ func (h *ServerHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.Update(r.Context(), item); err != nil {
 		writeServerStoreError(w, err)
 		return
+	}
+	if h.audit != nil {
+		user, _ := authctx.CurrentUser(r.Context())
+		_ = h.audit.Create(r.Context(), domain.AuditEvent{
+			Kind:       domain.AuditKindServer,
+			Severity:   "info",
+			Title:      "更新服务器",
+			Summary:    item.Name + " · " + item.IP,
+			ServerID:   item.ID,
+			ServerName: item.Name,
+			Username:   user.Username,
+			CreatedAt:  time.Now().UTC(),
+		})
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -212,6 +251,10 @@ func (p serverPayload) toDomain(id int64) (domain.Server, error) {
 	}
 
 	collectorMode := domain.NormalizeCollectorMode(p.CollectorMode)
+	maintenanceStartAt, maintenanceEndAt, err := parseMaintenanceWindow(p.MaintenanceStartAt, p.MaintenanceEndAt)
+	if err != nil {
+		return domain.Server{}, err
+	}
 
 	tags := p.Tags
 	if tags == nil {
@@ -219,24 +262,52 @@ func (p serverPayload) toDomain(id int64) (domain.Server, error) {
 	}
 
 	return domain.Server{
-		ID:            id,
-		Name:          name,
-		Hostname:      hostname,
-		IP:            ip,
-		SSHPort:       sshPort,
-		Username:      username,
-		AuthType:      authType,
-		Password:      password,
-		CollectorMode: collectorMode,
-		Tags:          tags,
-		Purpose:       strings.TrimSpace(p.Purpose),
-		Remark:        strings.TrimSpace(p.Remark),
-		Enabled:       enabled,
+		ID:                        id,
+		Name:                      name,
+		Hostname:                  hostname,
+		IP:                        ip,
+		SSHPort:                   sshPort,
+		Username:                  username,
+		AuthType:                  authType,
+		Password:                  password,
+		TrustedHostKeyFingerprint: strings.TrimSpace(p.TrustedHostKeyFingerprint),
+		CollectorMode:             collectorMode,
+		Tags:                      tags,
+		Purpose:                   strings.TrimSpace(p.Purpose),
+		Remark:                    strings.TrimSpace(p.Remark),
+		MaintenanceStartAt:        maintenanceStartAt,
+		MaintenanceEndAt:          maintenanceEndAt,
+		Enabled:                   enabled,
 	}, nil
 }
 
 func parseServerID(r *http.Request) (int64, error) {
 	return strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+}
+
+func parseMaintenanceWindow(startRaw string, endRaw string) (*time.Time, *time.Time, error) {
+	startRaw = strings.TrimSpace(startRaw)
+	endRaw = strings.TrimSpace(endRaw)
+	if startRaw == "" && endRaw == "" {
+		return nil, nil, nil
+	}
+	if startRaw == "" || endRaw == "" {
+		return nil, nil, errors.New("维护时间窗必须同时提供开始和结束时间")
+	}
+	startAt, err := time.Parse(time.RFC3339, startRaw)
+	if err != nil {
+		return nil, nil, errors.New("维护开始时间格式无效")
+	}
+	endAt, err := time.Parse(time.RFC3339, endRaw)
+	if err != nil {
+		return nil, nil, errors.New("维护结束时间格式无效")
+	}
+	if !endAt.After(startAt) {
+		return nil, nil, errors.New("维护结束时间必须晚于开始时间")
+	}
+	startAt = startAt.UTC()
+	endAt = endAt.UTC()
+	return &startAt, &endAt, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

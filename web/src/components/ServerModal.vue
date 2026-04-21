@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   NButton,
+  NDatePicker,
   NForm,
   NFormItem,
   NInput,
@@ -40,12 +41,17 @@ const form = reactive<ServerPayload>({
   username: 'root',
   authType: 'password',
   password: '',
+  trustedHostKeyFingerprint: '',
   collectorMode: 'ssh_only',
   tags: [],
   purpose: '',
   remark: '',
+  maintenanceStartAt: undefined,
+  maintenanceEndAt: undefined,
   enabled: true,
 })
+
+const maintenanceRange = ref<[number, number] | null>(null)
 
 const editing = computed(() => Boolean(props.server?.id))
 const title = computed(() => (editing.value ? '编辑服务器' : '新增服务器'))
@@ -92,10 +98,16 @@ function syncForm(server: ServerAsset | null) {
   form.username = server?.username ?? 'root'
   form.authType = 'password'
   form.password = ''
+  form.trustedHostKeyFingerprint = server?.trustedHostKeyFingerprint ?? ''
   form.collectorMode = server?.collectorMode ?? 'ssh_only'
   form.tags = server?.tags ? [...server.tags] : []
   form.purpose = server?.purpose ?? ''
   form.remark = server?.remark ?? ''
+  form.maintenanceStartAt = server?.maintenanceStartAt
+  form.maintenanceEndAt = server?.maintenanceEndAt
+  maintenanceRange.value = server?.maintenanceStartAt && server?.maintenanceEndAt
+    ? [Date.parse(server.maintenanceStartAt), Date.parse(server.maintenanceEndAt)]
+    : null
   form.enabled = server?.enabled ?? true
 }
 
@@ -103,8 +115,19 @@ function closeModal() {
   emit('update:show', false)
 }
 
+function handleMaintenanceRange(value: [number, number] | null) {
+  maintenanceRange.value = value
+  form.maintenanceStartAt = value ? new Date(value[0]).toISOString() : undefined
+  form.maintenanceEndAt = value ? new Date(value[1]).toISOString() : undefined
+}
+
 async function handleSubmit() {
   if (saving.value) {
+    return
+  }
+
+  if ((form.maintenanceStartAt && !form.maintenanceEndAt) || (!form.maintenanceStartAt && form.maintenanceEndAt)) {
+    message.warning('维护窗口必须同时提供开始和结束时间')
     return
   }
 
@@ -124,9 +147,12 @@ async function handleSubmit() {
       ...form,
       authType: 'password',
       password: password || undefined,
+      trustedHostKeyFingerprint: form.trustedHostKeyFingerprint?.trim() || undefined,
       tags: [...form.tags],
       purpose: form.purpose?.trim() || undefined,
       remark: form.remark?.trim() || undefined,
+      maintenanceStartAt: form.maintenanceStartAt || undefined,
+      maintenanceEndAt: form.maintenanceEndAt || undefined,
     }
 
     if (props.server?.id) {
@@ -197,6 +223,10 @@ async function handleSubmit() {
         </n-form-item>
       </div>
 
+      <n-form-item label="已信任主机指纹">
+        <n-input v-model:value="form.trustedHostKeyFingerprint" placeholder="首次探测并确认后会自动保存，也可手动粘贴" />
+      </n-form-item>
+
       <div class="form-grid form-grid--two">
         <n-form-item label="标签">
           <n-input v-model:value="tagsText" placeholder="例如：prod, web, cn-hz" />
@@ -212,6 +242,20 @@ async function handleSubmit() {
           type="textarea"
           :autosize="{ minRows: 3, maxRows: 6 }"
           placeholder="补充这台服务器的职责、网络限制或维护说明"
+        />
+      </n-form-item>
+
+      <n-form-item label="维护窗口">
+        <n-date-picker
+          v-model:value="maintenanceRange"
+          type="datetimerange"
+          clearable
+          style="width: 100%"
+          start-placeholder="维护开始时间"
+          end-placeholder="维护结束时间"
+          :actions="['clear', 'confirm']"
+          :update-value-on-close="true"
+          @update:value="handleMaintenanceRange"
         />
       </n-form-item>
 

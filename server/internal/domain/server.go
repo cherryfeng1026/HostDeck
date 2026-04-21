@@ -15,20 +15,31 @@ func NormalizeCollectorMode(mode string) string {
 }
 
 type Server struct {
-	ID                 int64     `json:"id"`
-	Name               string    `json:"name"`
-	Hostname           string    `json:"hostname"`
-	IP                 string    `json:"ip"`
-	SSHPort            int       `json:"sshPort"`
-	Username           string    `json:"username"`
-	AuthType           string    `json:"authType"`
-	PasswordConfigured bool      `json:"passwordConfigured"`
-	Password           string    `json:"-"`
-	CollectorMode      string    `json:"collectorMode"`
-	Tags               []string  `json:"tags"`
-	Purpose            string    `json:"purpose"`
-	Remark             string    `json:"remark"`
-	Enabled            bool      `json:"enabled"`
-	CreatedAt          time.Time `json:"createdAt"`
-	UpdatedAt          time.Time `json:"updatedAt"`
+	ID                        int64      `json:"id"`
+	Name                      string     `json:"name"`
+	Hostname                  string     `json:"hostname"`
+	IP                        string     `json:"ip"`
+	SSHPort                   int        `json:"sshPort"`
+	Username                  string     `json:"username"`
+	AuthType                  string     `json:"authType"`
+	PasswordConfigured        bool       `json:"passwordConfigured"`
+	TrustedHostKeyFingerprint string     `json:"trustedHostKeyFingerprint"`
+	Password                  string     `json:"-"`
+	CollectorMode             string     `json:"collectorMode"`
+	Tags                      []string   `json:"tags"`
+	Purpose                   string     `json:"purpose"`
+	Remark                    string     `json:"remark"`
+	MaintenanceStartAt        *time.Time `json:"maintenanceStartAt,omitempty"`
+	MaintenanceEndAt          *time.Time `json:"maintenanceEndAt,omitempty"`
+	Enabled                   bool       `json:"enabled"`
+	CreatedAt                 time.Time  `json:"createdAt"`
+	UpdatedAt                 time.Time  `json:"updatedAt"`
+}
+
+func (s Server) InMaintenanceWindow(at time.Time) bool {
+	if s.MaintenanceStartAt == nil || s.MaintenanceEndAt == nil {
+		return false
+	}
+	at = at.UTC()
+	return !at.Before(s.MaintenanceStartAt.UTC()) && at.Before(s.MaintenanceEndAt.UTC())
 }

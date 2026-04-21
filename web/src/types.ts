@@ -15,10 +15,13 @@ export interface ServerAsset {
   username: string
   authType: string
   passwordConfigured: boolean
+  trustedHostKeyFingerprint: string
   collectorMode: string
   tags: string[]
   purpose: string
   remark: string
+  maintenanceStartAt?: string
+  maintenanceEndAt?: string
   enabled: boolean
   createdAt: string
   updatedAt: string
@@ -50,6 +53,7 @@ export interface ServerStatusDetail {
   sshPort: number
   username: string
   collectorMode: string
+  trustedHostKeyFingerprint: string
   enabled: boolean
   online: boolean
   sshOk: boolean
@@ -82,8 +86,11 @@ export interface MetricsResponse {
 
 export interface TestSSHResponse {
   sshOk: boolean
-  latencyMs: number
+  latencyMs?: number
   error?: string
+  hostKeyFingerprint?: string
+  trustedHostKeyFingerprint?: string
+  fingerprintMismatch?: boolean
 }
 
 export interface ProbeResponse {
@@ -124,6 +131,50 @@ export interface BatchCommandResponse {
   results: BatchCommandResult[]
 }
 
+export interface CommandHistoryRecord {
+  id: number
+  serverId: number
+  serverName: string
+  executorUsername: string
+  command: string
+  stdout: string
+  stderr: string
+  exitCode: number
+  durationMs: number
+  executedAt: string
+}
+
+export interface CommandHistoryQuery {
+  limit?: number
+  serverId?: number
+  executorUsername?: string
+  keyword?: string
+  startTime?: string
+  endTime?: string
+}
+
+export interface CommandTemplateVariable {
+  name: string
+  label: string
+  placeholder?: string
+  defaultValue?: string
+  required: boolean
+}
+
+export interface CommandTemplate {
+  id: string
+  name: string
+  description: string
+  command: string
+  scope: string
+  riskLevel: string
+  variables: CommandTemplateVariable[]
+}
+
+export interface CommandTemplateListResponse {
+  items: CommandTemplate[]
+}
+
 export interface AlertRule {
   id: number
   metric: string
@@ -136,6 +187,7 @@ export interface AlertRule {
 }
 
 export interface AlertEvent {
+  id: number
   ruleId: number
   serverId: number
   serverName: string
@@ -145,17 +197,54 @@ export interface AlertEvent {
   currentValue: number
   severity: string
   message: string
+  status: string
   triggeredAt: string
+  lastTriggeredAt: string
+  acknowledgedAt?: string
+  acknowledgedBy?: string
+  mutedUntil?: string
   durationSeconds: number
+}
+
+export interface AlertHistoryEvent {
+  id: number
+  alertId: number
+  ruleId: number
+  serverId: number
+  serverName: string
+  eventType: string
+  metric: string
+  operator: string
+  threshold: number
+  currentValue: number
+  severity: string
+  message: string
+  status: string
+  triggeredAt: string
+  createdAt: string
+  actorUsername?: string
+  detail?: string
 }
 
 export interface User {
   id: number
   username: string
   role: string
+  enabled: boolean
   lastLoginAt?: string
   createdAt: string
   updatedAt: string
+}
+
+export interface CreateUserPayload {
+  username: string
+  password: string
+  role: string
+}
+
+export interface UpdateUserPayload {
+  role: string
+  enabled: boolean
 }
 
 export interface UserPermissions {
@@ -169,40 +258,66 @@ export interface AuthResponse {
   permissions: UserPermissions
 }
 
+export interface AuthStatusResponse {
+  initialized: boolean
+  bootstrapEnabled: boolean
+}
+
 export interface UserListResponse {
   items: User[]
 }
 
-export interface NotificationItem {
-  kind: string
-  severity: string
-  title: string
-  message: string
+export interface APITokenItem {
+  id: number
+  userId: number
+  name: string
+  prefix: string
+  lastUsedAt?: string
+  expiresAt?: string
   createdAt: string
+  updatedAt: string
+  revokedAt?: string
+  isActive: boolean
 }
 
-export interface ActivityItem {
+export interface APITokenListResponse {
+  items: APITokenItem[]
+}
+
+export interface CreateAPITokenPayload {
+  name: string
+  expiresInHours: number
+}
+
+export interface CreateAPITokenResponse {
+  token: string
+  item: APITokenItem
+}
+
+export interface ShellEventItem {
   kind: string
+  severity: string
   title: string
   summary: string
   createdAt: string
   serverId?: number
   serverName?: string
   username?: string
+  routePath?: string
+  isRead?: boolean
 }
 
 export interface NotificationListResponse {
-  items: NotificationItem[]
+  items: ShellEventItem[]
+  unreadCount: number
 }
 
 export interface ActivityListResponse {
-  items: ActivityItem[]
+  items: ShellEventItem[]
 }
 
 export interface SearchResults {
-  alerts: NotificationItem[]
-  commands: ActivityItem[]
-  authEvents: ActivityItem[]
+  items: ShellEventItem[]
 }
 
 export interface ServerPayload {
@@ -213,9 +328,12 @@ export interface ServerPayload {
   username: string
   authType?: string
   password?: string
+  trustedHostKeyFingerprint?: string
   collectorMode: string
   tags: string[]
   purpose?: string
   remark?: string
+  maintenanceStartAt?: string
+  maintenanceEndAt?: string
   enabled?: boolean
 }

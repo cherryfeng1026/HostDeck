@@ -4,29 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"testing"
-
-	_ "modernc.org/sqlite"
+	"time"
 
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/storage"
+	"hostdeck/server/internal/testsupport"
 )
 
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-
-	db, err := sql.Open("sqlite", "file:server-repository-test?mode=memory&cache=shared")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := storage.Migrate(context.Background(), db); err != nil {
-		t.Fatalf("migrate db: %v", err)
-	}
-
-	return db
+	return testsupport.OpenPostgresTestDB(t)
 }
 
 func TestServerRepository_CreateAndList(t *testing.T) {
@@ -82,18 +69,21 @@ func TestServerRepository_UpdateWithoutPasswordKeepsCredentialState(t *testing.T
 		t.Fatalf("create failed: %v", err)
 	}
 
-	err = repo.Update(context.Background(), domain.Server{
-		ID:            1,
-		Name:          "prod-web-01",
-		Hostname:      "prod-web-01",
-		IP:            "10.0.0.22",
-		SSHPort:       22,
-		Username:      "root",
-		AuthType:      "password",
-		CollectorMode: "ssh_only",
-		Enabled:       true,
-	})
-	if err != nil {
+	start := time.Date(2026, 4, 21, 1, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Hour)
+	if err := repo.Update(context.Background(), domain.Server{
+		ID:                 1,
+		Name:               "prod-web-01",
+		Hostname:           "prod-web-01",
+		IP:                 "10.0.0.22",
+		SSHPort:            22,
+		Username:           "root",
+		AuthType:           "password",
+		CollectorMode:      "ssh_only",
+		MaintenanceStartAt: &start,
+		MaintenanceEndAt:   &end,
+		Enabled:            true,
+	}); err != nil {
 		t.Fatalf("update failed: %v", err)
 	}
 
@@ -109,5 +99,11 @@ func TestServerRepository_UpdateWithoutPasswordKeepsCredentialState(t *testing.T
 	}
 	if items[0].IP != "10.0.0.22" {
 		t.Fatalf("expected updated ip, got %q", items[0].IP)
+	}
+	if items[0].MaintenanceStartAt == nil || !items[0].MaintenanceStartAt.Equal(start) {
+		t.Fatalf("expected maintenance start %v, got %v", start, items[0].MaintenanceStartAt)
+	}
+	if items[0].MaintenanceEndAt == nil || !items[0].MaintenanceEndAt.Equal(end) {
+		t.Fatalf("expected maintenance end %v, got %v", end, items[0].MaintenanceEndAt)
 	}
 }

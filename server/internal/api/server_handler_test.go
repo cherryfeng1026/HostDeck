@@ -2,47 +2,35 @@ package api_test
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	_ "modernc.org/sqlite"
-
 	"hostdeck/server/internal/api"
 	"hostdeck/server/internal/httpx"
 	"hostdeck/server/internal/storage"
+	"hostdeck/server/internal/testsupport"
 )
 
 type serverListItem struct {
-	ID                 int64    `json:"id"`
-	Name               string   `json:"name"`
-	IP                 string   `json:"ip"`
-	SSHPort            int      `json:"sshPort"`
-	CollectorMode      string   `json:"collectorMode"`
-	Tags               []string `json:"tags"`
-	Enabled            bool     `json:"enabled"`
-	PasswordConfigured bool     `json:"passwordConfigured"`
+	ID                        int64    `json:"id"`
+	Name                      string   `json:"name"`
+	IP                        string   `json:"ip"`
+	SSHPort                   int      `json:"sshPort"`
+	CollectorMode             string   `json:"collectorMode"`
+	TrustedHostKeyFingerprint string   `json:"trustedHostKeyFingerprint"`
+	Tags                      []string `json:"tags"`
+	MaintenanceStartAt        string   `json:"maintenanceStartAt"`
+	MaintenanceEndAt          string   `json:"maintenanceEndAt"`
+	Enabled                   bool     `json:"enabled"`
+	PasswordConfigured        bool     `json:"passwordConfigured"`
 }
 
 func openAPITestDB(t *testing.T) *sql.DB {
 	t.Helper()
-
-	db, err := sql.Open("sqlite", "file:server-handler-test?mode=memory&cache=shared")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := storage.Migrate(context.Background(), db); err != nil {
-		t.Fatalf("migrate db: %v", err)
-	}
-
-	return db
+	return testsupport.OpenPostgresTestDB(t)
 }
 
 func TestServerRoutes_CRUD(t *testing.T) {
@@ -53,7 +41,7 @@ func TestServerRoutes_CRUD(t *testing.T) {
 	createReq := httptest.NewRequest(
 		http.MethodPost,
 		"/api/servers",
-		bytes.NewBufferString(`{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.21","sshPort":22,"username":"root","authType":"password","password":"super-secret","collectorMode":"ssh_only","tags":["prod","web"]}`),
+		bytes.NewBufferString(`{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.21","sshPort":22,"username":"root","authType":"password","password":"super-secret","trustedHostKeyFingerprint":"SHA256:trusted-create","collectorMode":"ssh_only","tags":["prod","web"],"maintenanceStartAt":"2026-04-21T01:00:00Z","maintenanceEndAt":"2026-04-21T03:00:00Z"}`),
 	)
 	createReq.Header.Set("Content-Type", "application/json")
 	createRec := httptest.NewRecorder()
@@ -70,8 +58,14 @@ func TestServerRoutes_CRUD(t *testing.T) {
 	if items[0].Name != "prod-web-01" || items[0].IP != "10.0.0.21" {
 		t.Fatalf("unexpected server after create: %+v", items[0])
 	}
+	if items[0].TrustedHostKeyFingerprint != "SHA256:trusted-create" {
+		t.Fatalf("unexpected trusted fingerprint after create: %+v", items[0])
+	}
 	if !items[0].Enabled {
 		t.Fatalf("expected created server to be enabled by default")
+	}
+	if items[0].MaintenanceStartAt != "2026-04-21T01:00:00Z" || items[0].MaintenanceEndAt != "2026-04-21T03:00:00Z" {
+		t.Fatalf("unexpected maintenance window after create: %+v", items[0])
 	}
 	if !items[0].PasswordConfigured {
 		t.Fatalf("expected created server passwordConfigured to be true")
@@ -80,7 +74,7 @@ func TestServerRoutes_CRUD(t *testing.T) {
 	updateReq := httptest.NewRequest(
 		http.MethodPut,
 		"/api/servers/1",
-		bytes.NewBufferString(`{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.22","sshPort":2222,"username":"admin","authType":"password","collectorMode":"prefer_agent","tags":["prod"],"enabled":false}`),
+		bytes.NewBufferString(`{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.22","sshPort":2222,"username":"admin","authType":"password","trustedHostKeyFingerprint":"SHA256:trusted-update","collectorMode":"prefer_agent","tags":["prod"],"maintenanceStartAt":"2026-04-22T01:00:00Z","maintenanceEndAt":"2026-04-22T04:00:00Z","enabled":false}`),
 	)
 	updateReq.Header.Set("Content-Type", "application/json")
 	updateRec := httptest.NewRecorder()
@@ -96,6 +90,12 @@ func TestServerRoutes_CRUD(t *testing.T) {
 	}
 	if items[0].SSHPort != 2222 || items[0].CollectorMode != "ssh_only" {
 		t.Fatalf("unexpected server after update: %+v", items[0])
+	}
+	if items[0].TrustedHostKeyFingerprint != "SHA256:trusted-update" {
+		t.Fatalf("unexpected trusted fingerprint after update: %+v", items[0])
+	}
+	if items[0].MaintenanceStartAt != "2026-04-22T01:00:00Z" || items[0].MaintenanceEndAt != "2026-04-22T04:00:00Z" {
+		t.Fatalf("unexpected maintenance window after update: %+v", items[0])
 	}
 	if items[0].Enabled {
 		t.Fatalf("expected updated server to be disabled")
@@ -223,6 +223,44 @@ func TestServerRoutes_ListDoesNotReturnPassword(t *testing.T) {
 	}
 	if _, ok := payload[0]["password"]; ok {
 		t.Fatalf("expected list payload to hide password, got %#v", payload[0]["password"])
+	}
+}
+
+func TestServerRoutes_CreateRejectsIncompleteMaintenanceWindow(t *testing.T) {
+	db := openAPITestDB(t)
+	repo := storage.NewServerRepository(db, "test-master-key")
+	router := httpx.NewRouterWithHandlers(api.NewServerHandler(repo, nil), nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/servers",
+		bytes.NewBufferString(`{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.21","username":"root","authType":"password","password":"super-secret","collectorMode":"ssh_only","maintenanceStartAt":"2026-04-21T01:00:00Z"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
+	}
+}
+
+func TestServerRoutes_CreateRejectsInvalidMaintenanceWindow(t *testing.T) {
+	db := openAPITestDB(t)
+	repo := storage.NewServerRepository(db, "test-master-key")
+	router := httpx.NewRouterWithHandlers(api.NewServerHandler(repo, nil), nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/servers",
+		bytes.NewBufferString(`{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.21","username":"root","authType":"password","password":"super-secret","collectorMode":"ssh_only","maintenanceStartAt":"2026-04-21T03:00:00Z","maintenanceEndAt":"2026-04-21T01:00:00Z"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
 	}
 }
 

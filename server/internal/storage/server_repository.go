@@ -62,6 +62,7 @@ func (r *ServerRepository) Create(ctx context.Context, item domain.Server) error
 		item.AuthType = "password"
 	}
 	item.CollectorMode = domain.NormalizeCollectorMode(item.CollectorMode)
+	item.TrustedHostKeyFingerprint = strings.TrimSpace(item.TrustedHostKeyFingerprint)
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -75,9 +76,10 @@ func (r *ServerRepository) Create(ctx context.Context, item domain.Server) error
 	err = tx.QueryRowContext(
 		ctx,
 		`INSERT INTO servers (
-			name, hostname, ip, ssh_port, username, auth_type,
-			collector_mode, tags, purpose, remark, enabled, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			name, hostname, ip, ssh_port, username, auth_type, trusted_host_key_fingerprint,
+			collector_mode, tags, purpose, remark, maintenance_start_at, maintenance_end_at,
+			enabled, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id`,
 		item.Name,
 		item.Hostname,
@@ -85,10 +87,13 @@ func (r *ServerRepository) Create(ctx context.Context, item domain.Server) error
 		item.SSHPort,
 		item.Username,
 		item.AuthType,
+		item.TrustedHostKeyFingerprint,
 		item.CollectorMode,
 		tags,
 		item.Purpose,
 		item.Remark,
+		nullableRFC3339(item.MaintenanceStartAt),
+		nullableRFC3339(item.MaintenanceEndAt),
 		boolToInt(item.Enabled),
 		now.Format(time.RFC3339Nano),
 		now.Format(time.RFC3339Nano),
@@ -117,10 +122,13 @@ func (r *ServerRepository) List(ctx context.Context, filter ServerFilter) ([]dom
 		s.ssh_port,
 		s.username,
 		s.auth_type,
+		s.trusted_host_key_fingerprint,
 		s.collector_mode,
 		s.tags,
 		s.purpose,
 		s.remark,
+		s.maintenance_start_at,
+		s.maintenance_end_at,
 		s.enabled,
 		s.created_at,
 		s.updated_at,
@@ -192,6 +200,7 @@ func (r *ServerRepository) Update(ctx context.Context, item domain.Server) error
 		item.AuthType = "password"
 	}
 	item.CollectorMode = domain.NormalizeCollectorMode(item.CollectorMode)
+	item.TrustedHostKeyFingerprint = strings.TrimSpace(item.TrustedHostKeyFingerprint)
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -205,19 +214,22 @@ func (r *ServerRepository) Update(ctx context.Context, item domain.Server) error
 		ctx,
 		`UPDATE servers
 		SET name = $1, hostname = $2, ip = $3, ssh_port = $4, username = $5, auth_type = $6,
-		    collector_mode = $7, tags = $8, purpose = $9, remark = $10,
-		    enabled = $11, updated_at = $12
-		WHERE id = $13`,
+		    trusted_host_key_fingerprint = $7, collector_mode = $8, tags = $9, purpose = $10, remark = $11,
+		    maintenance_start_at = $12, maintenance_end_at = $13, enabled = $14, updated_at = $15
+		WHERE id = $16`,
 		item.Name,
 		item.Hostname,
 		item.IP,
 		item.SSHPort,
 		item.Username,
 		item.AuthType,
+		item.TrustedHostKeyFingerprint,
 		item.CollectorMode,
 		tags,
 		item.Purpose,
 		item.Remark,
+		nullableRFC3339(item.MaintenanceStartAt),
+		nullableRFC3339(item.MaintenanceEndAt),
 		boolToInt(item.Enabled),
 		time.Now().UTC().Format(time.RFC3339Nano),
 		item.ID,
@@ -232,6 +244,27 @@ func (r *ServerRepository) Update(ctx context.Context, item domain.Server) error
 
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (r *ServerRepository) UpdateTrustedHostKeyFingerprint(ctx context.Context, id int64, fingerprint string) error {
+	result, err := r.db.ExecContext(
+		ctx,
+		`UPDATE servers SET trusted_host_key_fingerprint = $1, updated_at = $2 WHERE id = $3`,
+		strings.TrimSpace(fingerprint),
+		time.Now().UTC().Format(time.RFC3339Nano),
+		id,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
 	}
 	return nil
 }
@@ -261,12 +294,14 @@ func scanServer(scanner interface {
 	Scan(dest ...any) error
 }) (domain.Server, error) {
 	var (
-		item               domain.Server
-		rawTags            string
-		rawCreate          string
-		rawUpdate          string
-		enabled            int
-		passwordConfigured int
+		item                 domain.Server
+		rawTags              string
+		rawCreate            string
+		rawUpdate            string
+		rawMaintenanceStart  sql.NullString
+		rawMaintenanceEnd    sql.NullString
+		enabled              int
+		passwordConfigured   int
 	)
 
 	err := scanner.Scan(
@@ -277,10 +312,13 @@ func scanServer(scanner interface {
 		&item.SSHPort,
 		&item.Username,
 		&item.AuthType,
+		&item.TrustedHostKeyFingerprint,
 		&item.CollectorMode,
 		&rawTags,
 		&item.Purpose,
 		&item.Remark,
+		&rawMaintenanceStart,
+		&rawMaintenanceEnd,
 		&enabled,
 		&rawCreate,
 		&rawUpdate,
@@ -297,6 +335,14 @@ func scanServer(scanner interface {
 	item.CollectorMode = domain.NormalizeCollectorMode(item.CollectorMode)
 	item.Enabled = enabled == 1
 	item.PasswordConfigured = passwordConfigured == 1
+	item.MaintenanceStartAt, err = parseNullableRFC3339(rawMaintenanceStart)
+	if err != nil {
+		return domain.Server{}, fmt.Errorf("parse maintenance_start_at: %w", err)
+	}
+	item.MaintenanceEndAt, err = parseNullableRFC3339(rawMaintenanceEnd)
+	if err != nil {
+		return domain.Server{}, fmt.Errorf("parse maintenance_end_at: %w", err)
+	}
 	item.CreatedAt, err = time.Parse(time.RFC3339Nano, rawCreate)
 	if err != nil {
 		return domain.Server{}, fmt.Errorf("parse created_at: %w", err)
@@ -338,6 +384,18 @@ func boolToInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func parseNullableRFC3339(value sql.NullString) (*time.Time, error) {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value.String)
+	if err != nil {
+		return nil, err
+	}
+	parsed = parsed.UTC()
+	return &parsed, nil
 }
 
 func wrapServerMutationError(err error, ip string) error {
