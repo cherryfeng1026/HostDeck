@@ -18,6 +18,7 @@ var ErrServerPasswordNotConfigured = errors.New("服务器未配置 SSH 密码")
 
 type ConnectionServerStore interface {
 	List(ctx context.Context, filter storage.ServerFilter) ([]domain.Server, error)
+	UpdateTrustedHostKeyFingerprint(ctx context.Context, id int64, fingerprint string) error
 }
 
 type ConnectionCredentialStore interface {
@@ -79,4 +80,18 @@ func (s *ServerConnectionService) ResolveServer(ctx context.Context, serverID in
 	server.Password = password
 	server.PasswordConfigured = true
 	return server, nil
+}
+
+func (s *ServerConnectionService) TrustHostKeyFingerprint(ctx context.Context, serverID int64, fingerprint string) error {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
+		return errors.New("SSH 主机指纹不能为空")
+	}
+	if err := s.servers.UpdateTrustedHostKeyFingerprint(ctx, serverID, fingerprint); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrConnectionServerNotFound
+		}
+		return err
+	}
+	return nil
 }

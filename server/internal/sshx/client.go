@@ -7,22 +7,37 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
 type Target struct {
-	Host          string
-	Port          int
-	Username      string
-	Password      string
-	PrivateKeyPEM string
-	Timeout       time.Duration
+	Host                      string
+	Port                      int
+	Username                  string
+	Password                  string
+	PrivateKeyPEM             string
+	TrustedHostKeyFingerprint string
+	Timeout                   time.Duration
 }
 
 type Runner interface {
 	Run(ctx context.Context, target Target, command string) (string, string, int, error)
+}
+
+type HostKeyFingerprintReader interface {
+	GetHostKeyFingerprint(ctx context.Context, target Target) (string, error)
+}
+
+type HostKeyMismatchError struct {
+	Expected string
+	Actual   string
+}
+
+func (e HostKeyMismatchError) Error() string {
+	return fmt.Sprintf("SSH 主机指纹不匹配，期望 %s，实际 %s", e.Expected, e.Actual)
 }
 
 type sessionClient interface {
@@ -83,6 +98,36 @@ func (c *Client) Run(ctx context.Context, target Target, command string) (string
 	return stdout.String(), stderr.String(), 0, nil
 }
 
+func (c *Client) GetHostKeyFingerprint(ctx context.Context, target Target) (string, error) {
+	capture := &hostKeyCapture{}
+	config, err := buildSSHConfig(target, capture)
+	if err != nil {
+		return "", err
+	}
+
+	conn, err := (&net.Dialer{Timeout: target.timeoutOrDefault()}).DialContext(ctx, "tcp", target.Address())
+	if err != nil {
+		return "", err
+	}
+
+	clientConn, chans, reqs, err := ssh.NewClientConn(conn, target.Address(), config)
+	if err != nil {
+		_ = conn.Close()
+		if capture.actual != "" {
+			var mismatch HostKeyMismatchError
+			if errors.As(err, &mismatch) {
+				return mismatch.Actual, err
+			}
+			return capture.actual, nil
+		}
+		return "", err
+	}
+
+	client := ssh.NewClient(clientConn, chans, reqs)
+	_ = client.Close()
+	return capture.actual, nil
+}
+
 type sshClientWrapper struct {
 	client *ssh.Client
 }
@@ -119,19 +164,26 @@ func (s *sshSessionWrapper) Close() error {
 	return s.session.Close()
 }
 
-func openSSHClient(ctx context.Context, target Target) (sessionClient, error) {
-	if target.Host == "" {
-		return nil, errors.New("SSH 目标主机不能为空")
-	}
-	if target.Username == "" {
-		return nil, errors.New("SSH 登录用户名不能为空")
-	}
+type hostKeyCapture struct {
+	actual string
+}
 
-	config := &ssh.ClientConfig{
-		User:            target.Username,
-		Auth:            buildAuthMethods(target),
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         target.timeoutOrDefault(),
+func (c *hostKeyCapture) callback(expected string) ssh.HostKeyCallback {
+	expected = strings.TrimSpace(expected)
+	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
+		c.actual = ssh.FingerprintSHA256(key)
+		if expected != "" && !strings.EqualFold(expected, c.actual) {
+			return HostKeyMismatchError{Expected: expected, Actual: c.actual}
+		}
+		return nil
+	}
+}
+
+func openSSHClient(ctx context.Context, target Target) (sessionClient, error) {
+	capture := &hostKeyCapture{}
+	config, err := buildSSHConfig(target, capture)
+	if err != nil {
+		return nil, err
 	}
 
 	conn, err := (&net.Dialer{Timeout: target.timeoutOrDefault()}).DialContext(ctx, "tcp", target.Address())
@@ -146,6 +198,25 @@ func openSSHClient(ctx context.Context, target Target) (sessionClient, error) {
 	}
 
 	return &sshClientWrapper{client: ssh.NewClient(clientConn, chans, reqs)}, nil
+}
+
+func buildSSHConfig(target Target, capture *hostKeyCapture) (*ssh.ClientConfig, error) {
+	if target.Host == "" {
+		return nil, errors.New("SSH 目标主机不能为空")
+	}
+	if target.Username == "" {
+		return nil, errors.New("SSH 登录用户名不能为空")
+	}
+	if capture == nil {
+		capture = &hostKeyCapture{}
+	}
+
+	return &ssh.ClientConfig{
+		User:            target.Username,
+		Auth:            buildAuthMethods(target),
+		HostKeyCallback: capture.callback(target.TrustedHostKeyFingerprint),
+		Timeout:         target.timeoutOrDefault(),
+	}, nil
 }
 
 func buildAuthMethods(target Target) []ssh.AuthMethod {

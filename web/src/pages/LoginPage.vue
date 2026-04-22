@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { NButton, NForm, NFormItem, NInput, NCheckbox, useMessage } from 'naive-ui'
-import { computed, ref } from 'vue'
+import { NAlert, NButton, NCheckbox, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { loginWithPassword, useSession } from '../session'
+import { ensureSessionLoaded, loginWithPassword, useSession } from '../session'
 
 const router = useRouter()
 const route = useRoute()
@@ -11,12 +11,23 @@ const { state } = useSession()
 const model = ref({
   username: '',
   password: '',
-  remember: true
+  remember: true,
 })
 
 const redirectTarget = computed(() => {
   const value = route.query.redirect
   return typeof value === 'string' && value.startsWith('/') ? value : '/'
+})
+
+onMounted(async () => {
+  try {
+    await ensureSessionLoaded(true)
+    if (state.user) {
+      await router.replace(redirectTarget.value)
+    }
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '初始化登录状态失败')
+  }
 })
 
 async function handleLogin() {
@@ -38,10 +49,8 @@ async function handleLogin() {
 
 <template>
   <div class="login-wrapper">
-    <!-- 极简网格背景 -->
     <div class="login-grid"></div>
 
-    <!-- 左上角 Logo -->
     <header class="top-nav">
       <div class="brand">
         <div class="brand-logo-small">
@@ -60,10 +69,8 @@ async function handleLogin() {
       </div>
     </header>
 
-    <!-- 居中登录框 -->
     <main class="login-container">
       <div class="login-card">
-        
         <div class="login-header">
           <div class="brand-logo-large">
             <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="url(#hostdeck-grad-large)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -81,24 +88,53 @@ async function handleLogin() {
           <p>轻量级 Linux 运维管理平台</p>
         </div>
 
+        <n-alert
+          v-if="!state.systemInitialized"
+          type="warning"
+          title="系统尚未初始化"
+          class="status-alert"
+        >
+          <template v-if="state.bootstrapEnabled">
+            当前还没有管理员账号，请使用初始化令牌调用 `/api/auth/bootstrap-admin` 完成首次管理员创建。
+          </template>
+          <template v-else>
+            当前还没有管理员账号，请在服务端配置 bootstrap 管理员信息或启用 bootstrap token 后完成初始化。
+          </template>
+        </n-alert>
+
         <n-form :model="model" size="large" class="login-form">
           <n-form-item path="username" label="用户名">
-            <n-input v-model:value="model.username" placeholder="" class="dark-input" @keyup.enter="handleLogin" />
+            <n-input
+              v-model:value="model.username"
+              placeholder=""
+              class="dark-input"
+              :disabled="!state.systemInitialized"
+              @keyup.enter="handleLogin"
+            />
           </n-form-item>
-          
+
           <n-form-item path="password" label="密码">
-            <n-input v-model:value="model.password" type="password" show-password-on="click" placeholder="" class="dark-input" @keyup.enter="handleLogin" />
+            <n-input
+              v-model:value="model.password"
+              type="password"
+              show-password-on="click"
+              placeholder=""
+              class="dark-input"
+              :disabled="!state.systemInitialized"
+              @keyup.enter="handleLogin"
+            />
           </n-form-item>
 
           <div class="form-actions">
-            <n-checkbox v-model:checked="model.remember" class="custom-checkbox">保持登录状态</n-checkbox>
+            <n-checkbox v-model:checked="model.remember" class="custom-checkbox" :disabled="!state.systemInitialized">保持登录状态</n-checkbox>
           </div>
 
-          <n-button 
-            block 
-            size="large" 
-            class="login-btn solid-green-btn" 
-            :loading="state.authenticating" 
+          <n-button
+            block
+            size="large"
+            class="login-btn solid-green-btn"
+            :loading="state.authenticating"
+            :disabled="!state.systemInitialized"
             @click="handleLogin"
           >
             进入系统
@@ -117,16 +153,15 @@ async function handleLogin() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background-color: #0b0e14; /* 极深灰蓝色背景 */
+  background-color: #0b0e14;
   font-family: 'Inter', 'PingFang SC', sans-serif;
   color: #fff;
 }
 
-/* 极简细线网格 */
 .login-grid {
   position: absolute;
   inset: 0;
-  background-image: 
+  background-image:
     linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
   background-size: 60px 60px;
@@ -134,7 +169,6 @@ async function handleLogin() {
   pointer-events: none;
 }
 
-/* 顶部导航 */
 .top-nav {
   position: absolute;
   top: 0;
@@ -164,7 +198,6 @@ async function handleLogin() {
   text-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
 }
 
-/* 登录卡片 */
 .login-container {
   position: relative;
   z-index: 10;
@@ -174,7 +207,7 @@ async function handleLogin() {
 }
 
 .login-card {
-  background-color: #12151c; /* 纯深色卡片背景 */
+  background-color: #12151c;
   border: 1px solid rgba(255, 255, 255, 0.05);
   border-radius: 24px;
   padding: 48px 40px;
@@ -208,7 +241,10 @@ async function handleLogin() {
   font-size: 14px;
 }
 
-/* 表单样式定制 */
+.status-alert {
+  margin-bottom: 24px;
+}
+
 :deep(.n-form-item-label) {
   color: #ededed !important;
   font-weight: 600;
@@ -216,7 +252,6 @@ async function handleLogin() {
   padding-bottom: 8px !important;
 }
 
-/* 输入框定制：深灰蓝背景 */
 :deep(.dark-input) {
   --n-color: #242936 !important;
   --n-color-focus: #2d3342 !important;
@@ -229,10 +264,9 @@ async function handleLogin() {
   --n-height: 48px !important;
 }
 
-/* 解决浏览器记住密码 Autofill 导致的内嵌背景色色差问题 */
 :deep(.dark-input .n-input__input-el:-webkit-autofill),
-:deep(.dark-input .n-input__input-el:-webkit-autofill:hover), 
-:deep(.dark-input .n-input__input-el:-webkit-autofill:focus), 
+:deep(.dark-input .n-input__input-el:-webkit-autofill:hover),
+:deep(.dark-input .n-input__input-el:-webkit-autofill:focus),
 :deep(.dark-input .n-input__input-el:-webkit-autofill:active) {
   -webkit-transition-delay: 99999s;
   -webkit-transition: color 99999s ease-out, background-color 99999s ease-out;
@@ -252,7 +286,6 @@ async function handleLogin() {
   --n-border-checked: 1px solid #10b981 !important;
 }
 
-/* 纯色登录按钮 */
 .solid-green-btn {
   height: 48px;
   border-radius: 8px;
@@ -265,7 +298,7 @@ async function handleLogin() {
 }
 
 .solid-green-btn:hover {
-  background-color: #0ea5e9 !important; /* 可以根据喜好改回绿色的高亮 */
+  background-color: #0ea5e9 !important;
   transform: translateY(-1px);
 }
 </style>

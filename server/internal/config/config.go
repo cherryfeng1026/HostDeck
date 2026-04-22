@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,20 +12,27 @@ import (
 )
 
 type Config struct {
-	HTTPAddr               string `yaml:"http_addr"`
-	DBDriver               string `yaml:"db_driver"`
-	DBPath                 string `yaml:"db_path"`
-	DBDSN                  string `yaml:"db_dsn"`
-	BootstrapAdminUsername string `yaml:"bootstrap_admin_username"`
-	BootstrapAdminPassword string `yaml:"bootstrap_admin_password"`
-	BootstrapAdminToken    string `yaml:"bootstrap_admin_token"`
-	MasterKey              string `yaml:"master_key"`
-	SessionCookieName      string `yaml:"session_cookie_name"`
-	SessionCookieSecure    bool   `yaml:"session_cookie_secure"`
-	SessionTTLHours        int    `yaml:"session_ttl_hours"`
-	WebDistDir             string `yaml:"web_dist_dir"`
-	PollIntervalSeconds    int    `yaml:"poll_interval_seconds"`
-	PollConcurrency        int    `yaml:"poll_concurrency"`
+	HTTPAddr                    string `yaml:"http_addr"`
+	DBDSN                       string `yaml:"db_dsn"`
+	BootstrapAdminUsername      string `yaml:"bootstrap_admin_username"`
+	BootstrapAdminPassword      string `yaml:"bootstrap_admin_password"`
+	BootstrapAdminToken         string `yaml:"bootstrap_admin_token"`
+	MasterKey                   string `yaml:"master_key"`
+	SessionCookieName           string `yaml:"session_cookie_name"`
+	SessionCookieSecure         bool   `yaml:"session_cookie_secure"`
+	SessionTTLHours             int    `yaml:"session_ttl_hours"`
+	WebDistDir                  string `yaml:"web_dist_dir"`
+	PollIntervalSeconds         int    `yaml:"poll_interval_seconds"`
+	PollConcurrency             int    `yaml:"poll_concurrency"`
+	CleanupIntervalSeconds      int    `yaml:"cleanup_interval_seconds"`
+	StatusHistoryRetentionHours int    `yaml:"status_history_retention_hours"`
+	CommandLogRetentionHours    int    `yaml:"command_log_retention_hours"`
+	AlertHistoryRetentionHours  int    `yaml:"alert_history_retention_hours"`
+	AuthEventRetentionHours     int    `yaml:"auth_event_retention_hours"`
+	AuditEventRetentionHours    int    `yaml:"audit_event_retention_hours"`
+	APITokenRetentionHours      int    `yaml:"api_token_retention_hours"`
+	AlertWebhookURL             string `yaml:"alert_webhook_url"`
+	AlertWebhookTimeoutSeconds  int    `yaml:"alert_webhook_timeout_seconds"`
 }
 
 func Load(configPath string) (Config, error) {
@@ -53,17 +61,15 @@ func Load(configPath string) (Config, error) {
 	}
 
 	normalizeConfig(&cfg)
+	if err := validateConfig(cfg); err != nil {
+		return Config{}, err
+	}
+
 	if baseDir != "" {
-		if cfg.DBDriver == "sqlite" {
-			cfg.DBPath = resolveRelativePath(baseDir, cfg.DBPath)
-		}
 		cfg.WebDistDir = resolveRelativePath(baseDir, cfg.WebDistDir)
 		return cfg, nil
 	}
 
-	if cfg.DBDriver == "sqlite" {
-		cfg.DBPath = filepath.Clean(cfg.DBPath)
-	}
 	cfg.WebDistDir = filepath.Clean(cfg.WebDistDir)
 	return cfg, nil
 }
@@ -74,27 +80,27 @@ func LoadFromEnv() (Config, error) {
 
 func defaultConfig() Config {
 	return Config{
-		HTTPAddr:            ":18080",
-		DBDriver:            "sqlite",
-		DBPath:              "./data/app.db",
-		SessionCookieName:   "hostdeck_session",
-		SessionCookieSecure: false,
-		SessionTTLHours:     24,
-		WebDistDir:          "../web/dist",
-		PollIntervalSeconds: 60,
-		PollConcurrency:     5,
+		HTTPAddr:                    ":18080",
+		SessionCookieName:           "hostdeck_session",
+		SessionCookieSecure:         false,
+		SessionTTLHours:             24,
+		WebDistDir:                  "../web/dist",
+		PollIntervalSeconds:         60,
+		PollConcurrency:             5,
+		CleanupIntervalSeconds:      3600,
+		StatusHistoryRetentionHours: 24 * 30,
+		CommandLogRetentionHours:    24 * 30,
+		AlertHistoryRetentionHours:  24 * 90,
+		AuthEventRetentionHours:     24 * 90,
+		AuditEventRetentionHours:    24 * 90,
+		APITokenRetentionHours:      24 * 30,
+		AlertWebhookTimeoutSeconds:  5,
 	}
 }
 
 func applyEnvOverrides(cfg *Config) error {
 	if value := os.Getenv("HOSTDECK_ADDR"); value != "" {
 		cfg.HTTPAddr = value
-	}
-	if value := os.Getenv("HOSTDECK_DB_DRIVER"); value != "" {
-		cfg.DBDriver = value
-	}
-	if value := os.Getenv("HOSTDECK_DB_PATH"); value != "" {
-		cfg.DBPath = value
 	}
 	if value := os.Getenv("HOSTDECK_DB_DSN"); value != "" {
 		cfg.DBDSN = value
@@ -127,6 +133,9 @@ func applyEnvOverrides(cfg *Config) error {
 	if value := os.Getenv("HOSTDECK_WEB_DIST_DIR"); value != "" {
 		cfg.WebDistDir = value
 	}
+	if value := os.Getenv("HOSTDECK_ALERT_WEBHOOK_URL"); value != "" {
+		cfg.AlertWebhookURL = value
+	}
 
 	interval, err := parseEnvInt("HOSTDECK_POLL_INTERVAL_SECONDS", cfg.PollIntervalSeconds)
 	if err != nil {
@@ -140,10 +149,50 @@ func applyEnvOverrides(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	cleanupIntervalSeconds, err := parseEnvInt("HOSTDECK_CLEANUP_INTERVAL_SECONDS", cfg.CleanupIntervalSeconds)
+	if err != nil {
+		return err
+	}
+	statusHistoryRetentionHours, err := parseEnvInt("HOSTDECK_STATUS_HISTORY_RETENTION_HOURS", cfg.StatusHistoryRetentionHours)
+	if err != nil {
+		return err
+	}
+	commandLogRetentionHours, err := parseEnvInt("HOSTDECK_COMMAND_LOG_RETENTION_HOURS", cfg.CommandLogRetentionHours)
+	if err != nil {
+		return err
+	}
+	alertHistoryRetentionHours, err := parseEnvInt("HOSTDECK_ALERT_HISTORY_RETENTION_HOURS", cfg.AlertHistoryRetentionHours)
+	if err != nil {
+		return err
+	}
+	authEventRetentionHours, err := parseEnvInt("HOSTDECK_AUTH_EVENT_RETENTION_HOURS", cfg.AuthEventRetentionHours)
+	if err != nil {
+		return err
+	}
+	auditEventRetentionHours, err := parseEnvInt("HOSTDECK_AUDIT_EVENT_RETENTION_HOURS", cfg.AuditEventRetentionHours)
+	if err != nil {
+		return err
+	}
+	apiTokenRetentionHours, err := parseEnvInt("HOSTDECK_API_TOKEN_RETENTION_HOURS", cfg.APITokenRetentionHours)
+	if err != nil {
+		return err
+	}
+	alertWebhookTimeoutSeconds, err := parseEnvInt("HOSTDECK_ALERT_WEBHOOK_TIMEOUT_SECONDS", cfg.AlertWebhookTimeoutSeconds)
+	if err != nil {
+		return err
+	}
 
 	cfg.PollIntervalSeconds = interval
 	cfg.PollConcurrency = concurrency
 	cfg.SessionTTLHours = sessionTTLHours
+	cfg.CleanupIntervalSeconds = cleanupIntervalSeconds
+	cfg.StatusHistoryRetentionHours = statusHistoryRetentionHours
+	cfg.CommandLogRetentionHours = commandLogRetentionHours
+	cfg.AlertHistoryRetentionHours = alertHistoryRetentionHours
+	cfg.AuthEventRetentionHours = authEventRetentionHours
+	cfg.AuditEventRetentionHours = auditEventRetentionHours
+	cfg.APITokenRetentionHours = apiTokenRetentionHours
+	cfg.AlertWebhookTimeoutSeconds = alertWebhookTimeoutSeconds
 	return nil
 }
 
@@ -152,23 +201,7 @@ func normalizeConfig(cfg *Config) {
 		cfg.HTTPAddr = ":18080"
 	}
 
-	cfg.DBDriver = strings.ToLower(strings.TrimSpace(cfg.DBDriver))
-	if cfg.DBDriver == "" {
-		if strings.TrimSpace(cfg.DBDSN) != "" {
-			cfg.DBDriver = "postgres"
-		} else {
-			cfg.DBDriver = "sqlite"
-		}
-	}
-
-	if cfg.DBDriver == "postgres" {
-		cfg.DBPath = ""
-	} else {
-		cfg.DBDSN = ""
-		if strings.TrimSpace(cfg.DBPath) == "" {
-			cfg.DBPath = "./data/app.db"
-		}
-	}
+	cfg.DBDSN = strings.TrimSpace(cfg.DBDSN)
 	if strings.TrimSpace(cfg.SessionCookieName) == "" {
 		cfg.SessionCookieName = "hostdeck_session"
 	}
@@ -178,6 +211,7 @@ func normalizeConfig(cfg *Config) {
 	cfg.BootstrapAdminUsername = strings.TrimSpace(cfg.BootstrapAdminUsername)
 	cfg.BootstrapAdminToken = strings.TrimSpace(cfg.BootstrapAdminToken)
 	cfg.MasterKey = strings.TrimSpace(cfg.MasterKey)
+	cfg.AlertWebhookURL = strings.TrimSpace(cfg.AlertWebhookURL)
 	if strings.TrimSpace(cfg.WebDistDir) == "" {
 		cfg.WebDistDir = "../web/dist"
 	}
@@ -187,6 +221,40 @@ func normalizeConfig(cfg *Config) {
 	if cfg.PollConcurrency <= 0 {
 		cfg.PollConcurrency = 5
 	}
+	if cfg.CleanupIntervalSeconds <= 0 {
+		cfg.CleanupIntervalSeconds = 3600
+	}
+	if cfg.StatusHistoryRetentionHours <= 0 {
+		cfg.StatusHistoryRetentionHours = 24 * 30
+	}
+	if cfg.CommandLogRetentionHours <= 0 {
+		cfg.CommandLogRetentionHours = 24 * 30
+	}
+	if cfg.AlertHistoryRetentionHours <= 0 {
+		cfg.AlertHistoryRetentionHours = 24 * 90
+	}
+	if cfg.AuthEventRetentionHours <= 0 {
+		cfg.AuthEventRetentionHours = 24 * 90
+	}
+	if cfg.AuditEventRetentionHours <= 0 {
+		cfg.AuditEventRetentionHours = 24 * 90
+	}
+	if cfg.APITokenRetentionHours <= 0 {
+		cfg.APITokenRetentionHours = 24 * 30
+	}
+	if cfg.AlertWebhookTimeoutSeconds <= 0 {
+		cfg.AlertWebhookTimeoutSeconds = 5
+	}
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.DBDSN == "" {
+		return errors.New("postgres dsn is required")
+	}
+	if cfg.AlertWebhookURL != "" && cfg.MasterKey == "" {
+		return errors.New("master_key is required when alert webhook is configured")
+	}
+	return nil
 }
 
 func resolveRelativePath(baseDir string, value string) string {
@@ -194,8 +262,8 @@ func resolveRelativePath(baseDir string, value string) string {
 	if trimmed == "" {
 		return trimmed
 	}
-	if trimmed == ":memory:" || strings.HasPrefix(trimmed, "file:") || filepath.IsAbs(trimmed) {
-		return trimmed
+	if filepath.IsAbs(trimmed) {
+		return filepath.Clean(trimmed)
 	}
 	return filepath.Clean(filepath.Join(baseDir, trimmed))
 }

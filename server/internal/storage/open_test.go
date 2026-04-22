@@ -8,18 +8,8 @@ import (
 	"hostdeck/server/internal/storage"
 )
 
-func TestOpen_RejectsUnknownDriver(t *testing.T) {
-	_, err := storage.Open(context.Background(), "unknown", "ignored")
-	if err == nil {
-		t.Fatalf("expected unknown driver error")
-	}
-	if !strings.Contains(err.Error(), "unsupported db driver") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestOpen_PostgresRequiresDSN(t *testing.T) {
-	_, err := storage.Open(context.Background(), storage.DriverPostgres, "")
+	_, err := storage.Open(context.Background(), "")
 	if err == nil {
 		t.Fatalf("expected empty dsn error")
 	}

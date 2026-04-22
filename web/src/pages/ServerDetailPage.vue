@@ -4,18 +4,20 @@ import {
   NScrollbar,
   NSpin,
   NTag,
+  useDialog,
   useMessage,
 } from 'naive-ui'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import StatusTrendCard from '../components/StatusTrendCard.vue'
-import { getServerMetrics, getServerStatus, probeServer, testServerSSH } from '../services/api'
+import { getServerMetrics, getServerStatus, probeServer, testServerSSH, trustServerHostKey } from '../services/api'
 import { useSession } from '../session'
-import type { MetricPoint, ServerStatusDetail } from '../types'
+import type { MetricPoint, ServerStatusDetail, TestSSHResponse } from '../types'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const dialog = useDialog()
 const { canManageInfrastructure } = useSession()
 const loading = ref(false)
 const status = ref<ServerStatusDetail | null>(null)
@@ -58,13 +60,37 @@ async function handleProbe() {
   }
 }
 
+function showSSHResult(result: TestSSHResponse) {
+  if (!status.value) return
+  const canTrustHostKey = Boolean(
+    result.hostKeyFingerprint && (result.fingerprintMismatch || (result.sshOk && result.hostKeyFingerprint !== result.trustedHostKeyFingerprint)),
+  )
+  if (canTrustHostKey) {
+    dialog.warning({
+      title: result.fingerprintMismatch ? 'SSH 指纹不匹配' : '发现 SSH 主机指纹',
+      content: `${result.error || '请确认该主机指纹是否可信'}\n\n当前指纹：${result.hostKeyFingerprint}${result.trustedHostKeyFingerprint ? `\n已信任：${result.trustedHostKeyFingerprint}` : ''}`,
+      positiveText: '信任并保存',
+      negativeText: result.sshOk ? '稍后处理' : '取消',
+      onPositiveClick: async () => {
+        await trustServerHostKey(status.value!.id, result.hostKeyFingerprint!)
+        message.success(result.sshOk ? '已保存 SSH 主机指纹，后续连接将强制校验' : '已保存 SSH 主机指纹')
+        await loadData()
+      },
+    })
+    return
+  }
+  if (result.sshOk) {
+    message.success(`SSH 连接正常，耗时 ${result.latencyMs ?? 0} ms`)
+    return
+  }
+  message.warning(result.error || 'SSH 连接异常')
+}
+
 async function handleTestSSH() {
   if (!status.value) return
   try {
     const result = await testServerSSH(status.value.id)
-    message[result.sshOk ? 'success' : 'warning'](
-      result.sshOk ? `SSH 连接正常，耗时 ${result.latencyMs} ms` : result.error || 'SSH 连接异常',
-    )
+    showSSHResult(result)
   } catch (error) {
     message.error(error instanceof Error ? error.message : 'SSH 测试失败')
   }
@@ -103,7 +129,9 @@ function getTone(value: number) {
 
 watch(
   () => route.params.id,
-  () => { void loadData() },
+  () => {
+    void loadData()
+  },
 )
 
 onMounted(() => {
@@ -115,7 +143,6 @@ onMounted(() => {
   <n-scrollbar class="content-scroll">
     <div class="page-container">
       <n-spin :show="loading">
-        <!-- 头部区域 -->
         <div class="page-header">
           <div class="header-back">
             <n-button text style="color: #a1a1aa; font-size: 14px;" @click="router.push('/servers')">
@@ -154,8 +181,6 @@ onMounted(() => {
         </div>
 
         <div v-if="status" class="bento-grid">
-          
-          <!-- System Info Card -->
           <div class="bento-card span-2 sys-info-card">
             <div class="card-title">系统信息</div>
             <div class="info-grid">
@@ -172,6 +197,10 @@ onMounted(() => {
                 <span class="info-val">{{ status.collectorMode }}</span>
               </div>
               <div class="info-item">
+                <span class="info-label">已信任指纹</span>
+                <span class="info-val font-mono">{{ status.trustedHostKeyFingerprint || '未保存' }}</span>
+              </div>
+              <div class="info-item">
                 <span class="info-label">内核版本</span>
                 <span class="info-val">{{ status.kernelVersion || '尚未采集' }}</span>
               </div>
@@ -186,7 +215,6 @@ onMounted(() => {
             </div>
           </div>
 
-          <!-- Resource Cards -->
           <div class="bento-card resource-card">
             <div class="resource-header">
               <span class="res-title">CPU 使用率</span>
@@ -206,7 +234,7 @@ onMounted(() => {
               <div class="res-fill" :style="{ width: `${status.memoryUsage}%`, background: getTone(status.memoryUsage || 0) }"></div>
             </div>
           </div>
-          
+
           <div class="bento-card resource-card">
             <div class="resource-header">
               <span class="res-title">磁盘使用</span>
@@ -229,11 +257,9 @@ onMounted(() => {
             </div>
           </div>
 
-          <!-- Metrics Chart Area -->
           <div class="bento-card span-4 chart-card" style="padding: 0;">
             <StatusTrendCard title="最近 24 小时资源趋势" :points="metrics" />
           </div>
-
         </div>
       </n-spin>
     </div>
@@ -311,7 +337,6 @@ onMounted(() => {
   transform: translateY(-1px);
 }
 
-/* Bento Grid */
 .bento-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -337,7 +362,6 @@ onMounted(() => {
   margin-bottom: 16px;
 }
 
-/* Sys Info */
 .info-grid {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
@@ -367,7 +391,6 @@ onMounted(() => {
   font-family: 'Fira Code', monospace;
 }
 
-/* Resources */
 .resource-card {
   display: flex;
   flex-direction: column;
@@ -406,7 +429,6 @@ onMounted(() => {
   transition: width 0.3s ease, background-color 0.3s ease;
 }
 
-/* Chart Area */
 .chart-card {
   min-height: 300px;
 }

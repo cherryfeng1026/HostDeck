@@ -215,6 +215,28 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 `
 
+const createAlertNotificationSettingsTableSQL = `
+CREATE TABLE IF NOT EXISTS alert_notification_settings (
+    id BIGSERIAL PRIMARY KEY,
+    singleton SMALLINT NOT NULL DEFAULT 1 CHECK (singleton = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    webhook_url TEXT NOT NULL DEFAULT '',
+    webhook_timeout_seconds INTEGER NOT NULL DEFAULT 5,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+`
+
+const normalizeAlertNotificationSettingsSingletonSQL = `
+DELETE FROM alert_notification_settings
+ WHERE id NOT IN (
+    SELECT id FROM alert_notification_settings ORDER BY id ASC LIMIT 1
+ );
+ALTER TABLE alert_notification_settings ADD COLUMN IF NOT EXISTS singleton SMALLINT NOT NULL DEFAULT 1;
+UPDATE alert_notification_settings SET singleton = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_notification_settings_singleton ON alert_notification_settings (singleton);
+`
+
 const addServersTrustedHostKeyFingerprintSQL = `
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS trusted_host_key_fingerprint TEXT NOT NULL DEFAULT '';
 `
@@ -356,6 +378,18 @@ var schemaMigrations = []migrationStep{
 		version: 10,
 		statements: []string{
 			alterCommandLogsExecutedAtToTimestamptzSQL,
+		},
+	},
+	{
+		version: 11,
+		statements: []string{
+			createAlertNotificationSettingsTableSQL,
+		},
+	},
+	{
+		version: 12,
+		statements: []string{
+			normalizeAlertNotificationSettingsSingletonSQL,
 		},
 	},
 }

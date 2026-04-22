@@ -170,7 +170,7 @@ func (h *CommandHandler) Execute(w http.ResponseWriter, r *http.Request) {
 			Kind:      domain.AuditKindCommand,
 			Severity:  commandSeverity(result.ExitCode),
 			Title:     commandTitle(result.ExitCode),
-			Summary:   payload.Command,
+			Summary:   commandAuditSummary(result.ExitCode),
 			ServerID:  id,
 			Username:  user.Username,
 			CreatedAt: result.ExecutedAt,
@@ -205,7 +205,7 @@ func (h *CommandHandler) ExecuteBatch(w http.ResponseWriter, r *http.Request) {
 				Kind:       domain.AuditKindCommand,
 				Severity:   batchCommandSeverity(item),
 				Title:      batchCommandTitle(item),
-				Summary:    payload.Command,
+				Summary:    commandAuditSummary(item.Result.ExitCode),
 				ServerID:   item.ServerID,
 				ServerName: item.ServerName,
 				Username:   user.Username,
@@ -244,6 +244,13 @@ func batchCommandSeverity(item service.BatchCommandResult) string {
 		return "info"
 	}
 	return "warning"
+}
+
+func commandAuditSummary(exitCode int) string {
+	if exitCode == 0 {
+		return "命令执行成功"
+	}
+	return "命令执行失败"
 }
 
 func writeCommandError(w http.ResponseWriter, err error) {

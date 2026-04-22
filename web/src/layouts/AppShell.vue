@@ -2,23 +2,21 @@
 import { NBadge, NDropdown, NInput, NPopover, useMessage } from 'naive-ui'
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getActivityFeed, getNotifications, searchWorkspace } from '../services/api'
+import { getActivityFeed, getNotifications, markNotificationsRead, searchWorkspace } from '../services/api'
 import { logoutSession, useSession } from '../session'
-import type { ActivityItem, NotificationItem } from '../types'
+import type { ShellEventItem } from '../types'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const { currentUser } = useSession()
-const notifications = ref<NotificationItem[]>([])
-const activityItems = ref<ActivityItem[]>([])
+const notifications = ref<ShellEventItem[]>([])
+const activityItems = ref<ShellEventItem[]>([])
+const unreadNotificationCount = ref(0)
+const markingNotificationsRead = ref(false)
 const searchKeyword = ref('')
 const searchLoading = ref(false)
-const searchResults = reactive({
-  alerts: [] as NotificationItem[],
-  commands: [] as ActivityItem[],
-  authEvents: [] as ActivityItem[],
-})
+const searchResults = ref<ShellEventItem[]>([])
 const isSidebarCollapsed = ref(false)
 
 const dashboardIcon = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/></svg>'
@@ -67,7 +65,8 @@ const currentTitle = computed(() => {
   return 'HostDeck'
 })
 
-const activityCount = computed(() => notifications.value.length + activityItems.value.length)
+const activityCount = computed(() => unreadNotificationCount.value)
+const visibleNotifications = computed(() => notifications.value.slice(0, 2))
 const displayName = computed(() => currentUser.value?.username || '未登录')
 const roleLabel = computed(() => {
   switch (currentUser.value?.role) {
@@ -90,28 +89,52 @@ async function loadShellData() {
       getActivityFeed(6),
     ])
     notifications.value = notificationResponse.items
+    unreadNotificationCount.value = notificationResponse.unreadCount
     activityItems.value = activityResponse.items
   } catch {
     notifications.value = []
+    unreadNotificationCount.value = 0
     activityItems.value = []
+  }
+}
+
+async function handleNotificationsVisible(show: boolean) {
+  if (!show || unreadNotificationCount.value === 0 || markingNotificationsRead.value) {
+    return
+  }
+  const visibleUnreadItems = visibleNotifications.value.filter((item) => item.isRead === false && item.createdAt)
+  if (!visibleUnreadItems.length || unreadNotificationCount.value !== visibleUnreadItems.length) {
+    return
+  }
+  const readBefore = visibleUnreadItems
+    .map((item) => item.createdAt)
+    .sort((left, right) => new Date(left).getTime() - new Date(right).getTime())[0]
+  markingNotificationsRead.value = true
+  try {
+    await markNotificationsRead(readBefore)
+    notifications.value = notifications.value.map((item) => ({
+      ...item,
+      isRead: true,
+    }))
+    unreadNotificationCount.value = 0
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '更新通知状态失败')
+  } finally {
+    markingNotificationsRead.value = false
   }
 }
 
 async function handleSearch() {
   const keyword = searchKeyword.value.trim()
   if (!keyword) {
-    searchResults.alerts = []
-    searchResults.commands = []
-    searchResults.authEvents = []
+    searchResults.value = []
     return
   }
 
   searchLoading.value = true
   try {
     const results = await searchWorkspace(keyword, 5)
-    searchResults.alerts = results.alerts
-    searchResults.commands = results.commands
-    searchResults.authEvents = results.authEvents
+    searchResults.value = results.items
   } catch (error) {
     message.error(error instanceof Error ? error.message : '搜索失败')
   } finally {
@@ -128,6 +151,38 @@ async function handleUserMenuSelect(key: string) {
     await logoutSession()
     await router.replace('/login')
   }
+}
+
+async function openShellItem(item: ShellEventItem) {
+  if (!item.routePath) {
+    return
+  }
+  searchResults.value = []
+  await router.push(item.routePath)
+}
+
+function openShellItemFromKeyboard(event: KeyboardEvent, item: ShellEventItem) {
+  if (event.key !== 'Enter' && event.key !== ' ') {
+    return
+  }
+  event.preventDefault()
+  void openShellItem(item)
+}
+
+function activateFromKeyboard(event: KeyboardEvent, action: () => void) {
+  if (event.key !== 'Enter' && event.key !== ' ') {
+    return
+  }
+  event.preventDefault()
+  action()
+}
+
+function triggerClickFromKeyboard(event: KeyboardEvent) {
+  if (event.key !== 'Enter' && event.key !== ' ') {
+    return
+  }
+  event.preventDefault()
+  ;(event.currentTarget as HTMLElement | null)?.click()
 }
 
 function formatDateTime(value: string) {
@@ -184,7 +239,7 @@ onMounted(() => {
     <main class="main-panel">
       <header class="topbar">
         <div class="topbar-leading">
-          <div class="sidebar-toggle" @click="toggleSidebar" :title="isSidebarCollapsed ? '展开侧边栏' : '收起侧边栏'">
+          <div class="sidebar-toggle" role="button" tabindex="0" @click="toggleSidebar" @keydown="activateFromKeyboard($event, toggleSidebar)" :title="isSidebarCollapsed ? '展开侧边栏' : '收起侧边栏'" :aria-label="isSidebarCollapsed ? '展开侧边栏' : '收起侧边栏'">
             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>
           </div>
           <div class="topbar-route">
@@ -201,35 +256,19 @@ onMounted(() => {
             </n-input>
             
             <div v-if="searchKeyword.trim()" class="search-results">
-              <div v-if="searchResults.alerts.length" class="search-group">
-                <strong>告警</strong>
-                <div v-for="item in searchResults.alerts" :key="`${item.kind}-${item.title}-${item.createdAt}`" class="search-item">
-                  <span>{{ item.title }}</span>
-                  <small>{{ item.message }}</small>
-                </div>
-              </div>
-              <div v-if="searchResults.commands.length" class="search-group">
-                <strong>命令</strong>
-                <div v-for="item in searchResults.commands" :key="`${item.kind}-${item.summary}-${item.createdAt}`" class="search-item">
-                  <span>{{ item.serverName || item.title }}</span>
-                  <small>{{ item.summary }}</small>
-                </div>
-              </div>
-              <div v-if="searchResults.authEvents.length" class="search-group">
-                <strong>认证</strong>
-                <div v-for="item in searchResults.authEvents" :key="`${item.kind}-${item.summary}-${item.createdAt}`" class="search-item">
-                  <span>{{ item.title }}</span>
-                  <small>{{ item.summary }}</small>
-                </div>
+              <div v-if="!searchResults.length" class="activity-empty">暂无匹配结果</div>
+              <div v-for="item in searchResults" :key="`${item.kind}-${item.title}-${item.createdAt}`" class="search-item" :class="{ clickable: !!item.routePath }" :role="item.routePath ? 'button' : undefined" :tabindex="item.routePath ? 0 : undefined" @click="openShellItem(item)" @keydown="openShellItemFromKeyboard($event, item)">
+                <span>{{ item.title }}</span>
+                <small>{{ item.summary }}</small>
               </div>
             </div>
           </div>
 
           <div class="toolbar-actions">
             <!-- Notifications Popover -->
-            <n-popover trigger="click" placement="bottom-end" :show-arrow="false" style="padding: 0; background: rgba(20,20,25,0.9); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; backdrop-filter: blur(20px);">
+            <n-popover trigger="click" placement="bottom-end" :show-arrow="false" style="padding: 0; background: rgba(20,20,25,0.9); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; backdrop-filter: blur(20px);" @update:show="handleNotificationsVisible">
               <template #trigger>
-                <div class="action-btn">
+                <div class="action-btn" role="button" tabindex="0" aria-label="打开系统动态通知" @keydown="triggerClickFromKeyboard">
                   <n-badge :value="activityCount" :max="99" color="#f43f5e">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
                   </n-badge>
@@ -241,11 +280,11 @@ onMounted(() => {
                   <small>仅展示关键安全事件与命令执行</small>
                 </div>
                 <div v-if="!notifications.length && !activityItems.length" class="activity-empty">暂无最新动态</div>
-                <div v-for="item in notifications.slice(0, 2)" :key="`${item.kind}-${item.title}-${item.createdAt}`" class="activity-item">
+                <div v-for="item in visibleNotifications" :key="`${item.kind}-${item.title}-${item.createdAt}`" class="activity-item" :class="{ clickable: !!item.routePath, unread: item.isRead === false }" :role="item.routePath ? 'button' : undefined" :tabindex="item.routePath ? 0 : undefined" @click="openShellItem(item)" @keydown="openShellItemFromKeyboard($event, item)">
                   <span>{{ item.title }}</span>
-                  <small>{{ item.message }}</small>
+                  <small>{{ item.summary }}</small>
                 </div>
-                <div v-for="item in activityItems.slice(0, 2)" :key="`${item.kind}-${item.title}-${item.createdAt}`" class="activity-item">
+                <div v-for="item in activityItems.slice(0, 2)" :key="`${item.kind}-${item.title}-${item.createdAt}`" class="activity-item" :class="{ clickable: !!item.routePath }" :role="item.routePath ? 'button' : undefined" :tabindex="item.routePath ? 0 : undefined" @click="openShellItem(item)" @keydown="openShellItemFromKeyboard($event, item)">
                   <span>{{ item.title }}</span>
                   <small>{{ item.summary }} · {{ formatDateTime(item.createdAt) }}</small>
                 </div>
@@ -254,7 +293,7 @@ onMounted(() => {
 
             <!-- User Dropdown -->
             <n-dropdown trigger="click" :options="userMenuOptions" @select="handleUserMenuSelect">
-              <div class="user-chip">
+              <div class="user-chip" role="button" tabindex="0" aria-label="打开用户菜单" @keydown="triggerClickFromKeyboard">
                 <div class="user-avatar">{{ displayName.charAt(0).toUpperCase() }}</div>
                 <div class="user-info">
                   <span class="user-name">{{ displayName }}</span>
@@ -525,6 +564,16 @@ onMounted(() => {
   background: rgba(255, 255, 255, 0.03);
 }
 
+.search-item.clickable,
+.activity-item.clickable {
+  cursor: pointer;
+}
+
+.search-item.clickable:hover,
+.activity-item.clickable:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
 .search-item span {
   color: #ededed;
   font-size: 13px;
@@ -642,6 +691,10 @@ onMounted(() => {
   padding: 8px;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.03);
+}
+.activity-item.unread {
+  border: 1px solid rgba(244, 63, 94, 0.25);
+  background: rgba(244, 63, 94, 0.08);
 }
 .activity-item span {
   color: #fff;

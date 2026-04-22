@@ -226,6 +226,16 @@ export interface AlertHistoryEvent {
   detail?: string
 }
 
+export interface AlertNotificationSettings {
+  enabled: boolean
+  webhookURL: string
+  webhookConfigured?: boolean
+  clearWebhookURL?: boolean
+  webhookTimeoutSeconds: number
+  createdAt?: string
+  updatedAt?: string
+}
+
 export interface User {
   id: number
   username: string

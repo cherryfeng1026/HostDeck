@@ -169,6 +169,15 @@ func (r *StatusRepository) ListHistory(ctx context.Context, serverID int64, sinc
 	return points, rows.Err()
 }
 
+func (r *StatusRepository) DeleteHistoryBefore(ctx context.Context, cutoff time.Time) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`DELETE FROM server_status_history WHERE sampled_at < $1`,
+		cutoff.UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
 func scanLatestStatus(scanner interface {
 	Scan(dest ...any) error
 }) (LatestStatus, error) {

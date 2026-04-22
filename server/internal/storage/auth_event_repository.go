@@ -90,6 +90,15 @@ func (r *AuthEventRepository) ListRecent(ctx context.Context, limit int, keyword
 	return items, rows.Err()
 }
 
+func (r *AuthEventRepository) DeleteBefore(ctx context.Context, cutoff time.Time) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`DELETE FROM auth_events WHERE created_at < $1`,
+		cutoff.UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
 func scanAuthEvent(scanner interface {
 	Scan(dest ...any) error
 }) (domain.AuthEvent, error) {

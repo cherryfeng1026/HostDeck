@@ -6,13 +6,12 @@ import (
 	"testing"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"hostdeck/server/internal/collector"
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/service"
 	"hostdeck/server/internal/sshx"
 	"hostdeck/server/internal/storage"
+	"hostdeck/server/internal/testsupport"
 )
 
 type recordingRunner struct {
@@ -44,20 +43,7 @@ func (r *recordingRunner) Run(ctx context.Context, target sshx.Target, command s
 
 func openPollerTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-
-	db, err := sql.Open("sqlite", "file:poller-test?mode=memory&cache=shared")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := storage.Migrate(context.Background(), db); err != nil {
-		t.Fatalf("migrate db: %v", err)
-	}
-
-	return db
+	return testsupport.OpenPostgresTestDB(t)
 }
 
 func TestPollerCollectOnceUsesResolvedPasswordTarget(t *testing.T) {
@@ -89,6 +75,7 @@ func TestPollerCollectOnceUsesResolvedPasswordTarget(t *testing.T) {
 		connectionService,
 		collector.NewSSHCollector(runner),
 		storage.NewStatusRepository(db),
+		nil,
 		time.Minute,
 		2,
 	)

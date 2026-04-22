@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	ErrAlertNotFound         = errors.New("告警不存在")
-	ErrAlertActionNotAllowed = errors.New("当前告警状态不支持该操作")
+	ErrAlertNotFound                  = errors.New("告警不存在")
+	ErrAlertActionNotAllowed          = errors.New("当前告警状态不支持该操作")
+	ErrInvalidAlertNotificationSettings = errors.New("告警通知设置无效")
 )
 
 type AlertRuleStore interface {
@@ -35,22 +36,37 @@ type AlertStateStore interface {
 	Mute(ctx context.Context, alertID int64, username string, mutedUntil time.Time) (domain.AlertState, error)
 }
 
+type alertHistoryTypeReader interface {
+	ListHistoryByTypes(ctx context.Context, limit int, eventTypes ...string) ([]domain.AlertHistoryEvent, error)
+}
+
+type alertHistorySearchReader interface {
+	SearchHistory(ctx context.Context, query string, limit int, eventTypes ...string) ([]domain.AlertHistoryEvent, error)
+}
+
 type AlertServerStore interface {
 	List(ctx context.Context, filter storage.ServerFilter) ([]domain.Server, error)
+}
+
+type AlertNotificationSettingsStore interface {
+	GetNotificationSettings(ctx context.Context) (domain.AlertNotificationSettings, error)
+	SaveNotificationSettings(ctx context.Context, settings domain.AlertNotificationSettings) (domain.AlertNotificationSettings, error)
 }
 
 type AlertService struct {
 	rules    AlertRuleStore
 	states   AlertStateStore
 	servers  AlertServerStore
+	settings AlertNotificationSettingsStore
 	notifier AlertNotifier
 }
 
-func NewAlertService(rules AlertRuleStore, states AlertStateStore, servers AlertServerStore, notifiers ...AlertNotifier) *AlertService {
+func NewAlertService(rules AlertRuleStore, states AlertStateStore, servers AlertServerStore, settings AlertNotificationSettingsStore, notifiers ...AlertNotifier) *AlertService {
 	service := &AlertService{
-		rules:   rules,
-		states:  states,
-		servers: servers,
+		rules:    rules,
+		states:   states,
+		servers:  servers,
+		settings: settings,
 	}
 	if len(notifiers) > 0 {
 		service.notifier = notifiers[0]
@@ -99,6 +115,44 @@ func (s *AlertService) CreateRule(ctx context.Context, rule domain.AlertRule) er
 func (s *AlertService) UpdateRule(ctx context.Context, rule domain.AlertRule) error {
 	normalizeRule(&rule)
 	return s.rules.Update(ctx, rule)
+}
+
+func (s *AlertService) GetNotificationSettings(ctx context.Context) (domain.AlertNotificationSettings, error) {
+	if s.settings == nil {
+		return domain.AlertNotificationSettings{WebhookTimeoutSeconds: 5}, nil
+	}
+	return s.settings.GetNotificationSettings(ctx)
+}
+
+func (s *AlertService) SaveNotificationSettings(ctx context.Context, settings domain.AlertNotificationSettings) (domain.AlertNotificationSettings, error) {
+	settings.WebhookURL = strings.TrimSpace(settings.WebhookURL)
+	if settings.WebhookTimeoutSeconds <= 0 {
+		settings.WebhookTimeoutSeconds = 5
+	}
+	if s.settings == nil {
+		return domain.AlertNotificationSettings{}, errors.New("通知设置存储未配置")
+	}
+	current, err := s.settings.GetNotificationSettings(ctx)
+	if err != nil {
+		return domain.AlertNotificationSettings{}, err
+	}
+	if settings.ClearWebhookURL {
+		settings.WebhookURL = ""
+		settings.WebhookConfigured = false
+	} else if settings.WebhookURL == "" && strings.TrimSpace(current.WebhookURL) != "" {
+		settings.WebhookURL = strings.TrimSpace(current.WebhookURL)
+		settings.WebhookConfigured = true
+	}
+	if settings.Enabled && settings.WebhookURL == "" {
+		return domain.AlertNotificationSettings{}, fmt.Errorf("%w: 启用通知时必须填写 Webhook 地址", ErrInvalidAlertNotificationSettings)
+	}
+	if settings.WebhookURL != "" {
+		if _, err := NewWebhookAlertNotifier(settings.WebhookURL, time.Duration(settings.WebhookTimeoutSeconds)*time.Second); err != nil {
+			return domain.AlertNotificationSettings{}, fmt.Errorf("%w: %s", ErrInvalidAlertNotificationSettings, err.Error())
+		}
+		settings.WebhookConfigured = true
+	}
+	return s.settings.SaveNotificationSettings(ctx, settings)
 }
 
 func (s *AlertService) EvaluateServerSnapshot(ctx context.Context, server domain.Server, snapshot collector.Snapshot, sampledAt time.Time) error {
@@ -295,6 +349,35 @@ func (s *AlertService) ListAlertHistory(ctx context.Context, limit int) ([]domai
 	return s.states.ListHistory(ctx, limit)
 }
 
+func (s *AlertService) ListAlertHistoryByTypes(ctx context.Context, limit int, eventTypes ...string) ([]domain.AlertHistoryEvent, error) {
+	if reader, ok := s.states.(alertHistoryTypeReader); ok {
+		return reader.ListHistoryByTypes(ctx, limit, eventTypes...)
+	}
+	history, err := s.states.ListHistory(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	return filterAlertHistoryByTypes(history, eventTypes...), nil
+}
+
+func (s *AlertService) SearchAlertHistory(ctx context.Context, query string, limit int, eventTypes ...string) ([]domain.AlertHistoryEvent, error) {
+	if reader, ok := s.states.(alertHistorySearchReader); ok {
+		return reader.SearchHistory(ctx, query, limit, eventTypes...)
+	}
+	history, err := s.states.ListHistory(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	history = filterAlertHistoryByTypes(history, eventTypes...)
+	filtered := make([]domain.AlertHistoryEvent, 0, len(history))
+	for _, item := range history {
+		if matchesAlertHistoryQuery(query, item) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
 func (s *AlertService) AcknowledgeAlert(ctx context.Context, alertID int64, username string) (domain.AlertEvent, error) {
 	state, err := s.states.Acknowledge(ctx, alertID, username)
 	if err != nil {
@@ -398,6 +481,37 @@ func severityForMetric(metric string) string {
 		return "critical"
 	}
 	return "warning"
+}
+
+func filterAlertHistoryByTypes(items []domain.AlertHistoryEvent, eventTypes ...string) []domain.AlertHistoryEvent {
+	if len(eventTypes) == 0 {
+		return items
+	}
+	allowed := make(map[string]struct{}, len(eventTypes))
+	for _, eventType := range eventTypes {
+		allowed[strings.TrimSpace(eventType)] = struct{}{}
+	}
+	filtered := make([]domain.AlertHistoryEvent, 0, len(items))
+	for _, item := range items {
+		if _, ok := allowed[item.EventType]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func matchesAlertHistoryQuery(query string, item domain.AlertHistoryEvent) bool {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return true
+	}
+	values := []string{item.ServerName, item.Message, item.Metric, item.Detail, item.ActorUsername}
+	for _, value := range values {
+		if strings.Contains(strings.ToLower(value), query) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildAlertMessage(metric string, current float64, threshold float64) string {

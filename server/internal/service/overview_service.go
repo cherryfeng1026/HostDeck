@@ -29,27 +29,28 @@ type Overview struct {
 }
 
 type ServerStatusDetail struct {
-	ID            int64     `json:"id"`
-	Name          string    `json:"name"`
-	Hostname      string    `json:"hostname"`
-	IP            string    `json:"ip"`
-	SSHPort       int       `json:"sshPort"`
-	Username      string    `json:"username"`
-	CollectorMode string    `json:"collectorMode"`
-	Enabled       bool      `json:"enabled"`
-	Online        bool      `json:"online"`
-	SSHOK         bool      `json:"sshOk"`
-	CPUUsage      float64   `json:"cpuUsage"`
-	MemoryUsage   float64   `json:"memoryUsage"`
-	DiskUsage     float64   `json:"diskUsage"`
-	OSVersion     string    `json:"osVersion"`
-	KernelVersion string    `json:"kernelVersion"`
-	UptimeSeconds int64     `json:"uptimeSeconds"`
-	Load1         float64   `json:"load1"`
-	Load5         float64   `json:"load5"`
-	Load15        float64   `json:"load15"`
-	LastReportAt  time.Time `json:"lastReportAt"`
-	Source        string    `json:"source"`
+	ID                        int64     `json:"id"`
+	Name                      string    `json:"name"`
+	Hostname                  string    `json:"hostname"`
+	IP                        string    `json:"ip"`
+	SSHPort                   int       `json:"sshPort"`
+	Username                  string    `json:"username"`
+	CollectorMode             string    `json:"collectorMode"`
+	TrustedHostKeyFingerprint string    `json:"trustedHostKeyFingerprint"`
+	Enabled                   bool      `json:"enabled"`
+	Online                    bool      `json:"online"`
+	SSHOK                     bool      `json:"sshOk"`
+	CPUUsage                  float64   `json:"cpuUsage"`
+	MemoryUsage               float64   `json:"memoryUsage"`
+	DiskUsage                 float64   `json:"diskUsage"`
+	OSVersion                 string    `json:"osVersion"`
+	KernelVersion             string    `json:"kernelVersion"`
+	UptimeSeconds             int64     `json:"uptimeSeconds"`
+	Load1                     float64   `json:"load1"`
+	Load5                     float64   `json:"load5"`
+	Load15                    float64   `json:"load15"`
+	LastReportAt              time.Time `json:"lastReportAt"`
+	Source                    string    `json:"source"`
 }
 
 type OverviewAlertReader interface {
@@ -119,27 +120,28 @@ func (s *OverviewService) GetServerStatus(ctx context.Context, serverID int64) (
 
 	server := servers[0]
 	return ServerStatusDetail{
-		ID:            server.ID,
-		Name:          server.Name,
-		Hostname:      server.Hostname,
-		IP:            server.IP,
-		SSHPort:       server.SSHPort,
-		Username:      server.Username,
-		CollectorMode: server.CollectorMode,
-		Enabled:       server.Enabled,
-		Online:        latest.Online,
-		SSHOK:         latest.SSHOK,
-		CPUUsage:      latest.CPUUsage,
-		MemoryUsage:   latest.MemoryUsage,
-		DiskUsage:     latest.DiskUsage,
-		OSVersion:     latest.OSVersion,
-		KernelVersion: latest.KernelVersion,
-		UptimeSeconds: latest.UptimeSeconds,
-		Load1:         latest.Load1,
-		Load5:         latest.Load5,
-		Load15:        latest.Load15,
-		LastReportAt:  latest.LastReportAt,
-		Source:        latest.Source,
+		ID:                        server.ID,
+		Name:                      server.Name,
+		Hostname:                  server.Hostname,
+		IP:                        server.IP,
+		SSHPort:                   server.SSHPort,
+		Username:                  server.Username,
+		CollectorMode:             server.CollectorMode,
+		TrustedHostKeyFingerprint: server.TrustedHostKeyFingerprint,
+		Enabled:                   server.Enabled,
+		Online:                    latest.Online,
+		SSHOK:                     latest.SSHOK,
+		CPUUsage:                  latest.CPUUsage,
+		MemoryUsage:               latest.MemoryUsage,
+		DiskUsage:                 latest.DiskUsage,
+		OSVersion:                 latest.OSVersion,
+		KernelVersion:             latest.KernelVersion,
+		UptimeSeconds:             latest.UptimeSeconds,
+		Load1:                     latest.Load1,
+		Load5:                     latest.Load5,
+		Load15:                    latest.Load15,
+		LastReportAt:              latest.LastReportAt,
+		Source:                    latest.Source,
 	}, nil
 }
 

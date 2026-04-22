@@ -14,15 +14,31 @@ const (
 	AuthEventLoginSucceeded        = "login_succeeded"
 	AuthEventLogout                = "logout"
 	AuthEventPasswordChanged       = "password_changed"
+	AuthEventUserCreated           = "user_created"
+	AuthEventUserUpdated           = "user_updated"
+	AuthEventUserPasswordReset     = "user_password_reset"
+	AuthEventUserSessionsRevoked   = "user_sessions_revoked"
+	AuthEventAPITokenCreated       = "api_token_created"
+	AuthEventAPITokenRevoked       = "api_token_revoked"
 )
 
 type User struct {
 	ID          int64      `json:"id"`
 	Username    string     `json:"username"`
 	Role        string     `json:"role"`
+	Enabled     bool       `json:"enabled"`
 	LastLoginAt *time.Time `json:"lastLoginAt,omitempty"`
 	CreatedAt   time.Time  `json:"createdAt"`
 	UpdatedAt   time.Time  `json:"updatedAt"`
+}
+
+func NormalizeUserRole(role string) string {
+	switch role {
+	case RoleAdmin, RoleOperator, RoleViewer:
+		return role
+	default:
+		return ""
+	}
 }
 
 type AuthEvent struct {
@@ -34,6 +50,19 @@ type AuthEvent struct {
 	IP        string    `json:"ip,omitempty"`
 	UserAgent string    `json:"userAgent,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+type APIToken struct {
+	ID          int64      `json:"id"`
+	UserID      int64      `json:"userId"`
+	Name        string     `json:"name"`
+	Prefix      string     `json:"prefix"`
+	LastUsedAt  *time.Time `json:"lastUsedAt,omitempty"`
+	ExpiresAt   *time.Time `json:"expiresAt,omitempty"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	UpdatedAt   time.Time  `json:"updatedAt"`
+	RevokedAt   *time.Time `json:"revokedAt,omitempty"`
+	IsActive    bool       `json:"isActive"`
 }
 
 func CanManageInfrastructure(role string) bool {

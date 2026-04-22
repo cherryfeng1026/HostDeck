@@ -3,8 +3,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"hostdeck/server/internal/domain"
 )
 
@@ -15,6 +20,25 @@ type UserRecord struct {
 
 type UserRepository struct {
 	db *sql.DB
+}
+
+var ErrUserUsernameConflict = errors.New("用户名已存在")
+
+type UserUsernameConflictError struct {
+	Username string
+}
+
+func (e UserUsernameConflictError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrUserUsernameConflict.Error(), e.Username)
+}
+
+func (e UserUsernameConflictError) Is(target error) bool {
+	return target == ErrUserUsernameConflict
+}
+
+type UserUpdateInput struct {
+	Role    string
+	Enabled *bool
 }
 
 func NewUserRepository(db *sql.DB) *UserRepository {
@@ -42,12 +66,13 @@ func (r *UserRepository) Create(ctx context.Context, username string, passwordHa
 
 	err := r.db.QueryRowContext(
 		ctx,
-		`INSERT INTO users (username, password_hash, role, last_login_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING id, username, role, last_login_at, created_at, updated_at`,
+		`INSERT INTO users (username, password_hash, role, enabled, last_login_at, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 RETURNING id, username, role, enabled, last_login_at, created_at, updated_at`,
 		username,
 		passwordHash,
 		role,
+		true,
 		"",
 		now,
 		now,
@@ -55,12 +80,13 @@ func (r *UserRepository) Create(ctx context.Context, username string, passwordHa
 		&user.ID,
 		&user.Username,
 		&user.Role,
+		&user.Enabled,
 		&lastLoginAt,
 		&createdAt,
 		&updatedAt,
 	)
 	if err != nil {
-		return domain.User{}, err
+		return domain.User{}, wrapUserMutationError(err, username)
 	}
 
 	if err := fillUserTimestamps(&user, lastLoginAt, createdAt, updatedAt); err != nil {
@@ -72,7 +98,7 @@ func (r *UserRepository) Create(ctx context.Context, username string, passwordHa
 func (r *UserRepository) GetByUsername(ctx context.Context, username string) (UserRecord, error) {
 	row := r.db.QueryRowContext(
 		ctx,
-		`SELECT id, username, password_hash, role, last_login_at, created_at, updated_at
+		`SELECT id, username, password_hash, role, enabled, last_login_at, created_at, updated_at
 		   FROM users
 		  WHERE username = $1`,
 		username,
@@ -83,7 +109,7 @@ func (r *UserRepository) GetByUsername(ctx context.Context, username string) (Us
 func (r *UserRepository) GetByID(ctx context.Context, id int64) (UserRecord, error) {
 	row := r.db.QueryRowContext(
 		ctx,
-		`SELECT id, username, password_hash, role, last_login_at, created_at, updated_at
+		`SELECT id, username, password_hash, role, enabled, last_login_at, created_at, updated_at
 		   FROM users
 		  WHERE id = $1`,
 		id,
@@ -94,7 +120,7 @@ func (r *UserRepository) GetByID(ctx context.Context, id int64) (UserRecord, err
 func (r *UserRepository) List(ctx context.Context) ([]domain.User, error) {
 	rows, err := r.db.QueryContext(
 		ctx,
-		`SELECT id, username, role, last_login_at, created_at, updated_at
+		`SELECT id, username, role, enabled, last_login_at, created_at, updated_at
 		   FROM users
 		  ORDER BY id ASC`,
 	)
@@ -111,7 +137,7 @@ func (r *UserRepository) List(ctx context.Context) ([]domain.User, error) {
 			createdAt   string
 			updatedAt   string
 		)
-		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &lastLoginAt, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &user.Enabled, &lastLoginAt, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		if err := fillUserTimestamps(&user, lastLoginAt, createdAt, updatedAt); err != nil {
@@ -151,6 +177,74 @@ func (r *UserRepository) UpdatePassword(ctx context.Context, id int64, passwordH
 	return err
 }
 
+func (r *UserRepository) GetNotificationReadAt(ctx context.Context, id int64) (*time.Time, error) {
+	var value string
+	if err := r.db.QueryRowContext(ctx, `SELECT notification_read_at FROM users WHERE id = $1`, id).Scan(&value); err != nil {
+		return nil, err
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func (r *UserRepository) UpdateNotificationReadAt(ctx context.Context, id int64, readAt time.Time) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`UPDATE users
+		    SET notification_read_at = $1, updated_at = $1
+		  WHERE id = $2`,
+		readAt.UTC().Format(time.RFC3339Nano),
+		id,
+	)
+	return err
+}
+
+func wrapUserMutationError(err error, username string) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && strings.Contains(pgErr.ConstraintName, "users_username") {
+		return UserUsernameConflictError{Username: username}
+	}
+	if strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
+		return UserUsernameConflictError{Username: username}
+	}
+	return err
+}
+
+func (r *UserRepository) Update(ctx context.Context, id int64, input UserUpdateInput, updatedAt time.Time) error {
+	fields := make([]string, 0, 3)
+	args := make([]any, 0, 4)
+	index := 1
+	if input.Role != "" {
+		fields = append(fields, "role = $1")
+		args = append(args, input.Role)
+		index++
+	}
+	if input.Enabled != nil {
+		fields = append(fields, "enabled = $"+strconv.Itoa(index))
+		args = append(args, *input.Enabled)
+		index++
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	fields = append(fields, "updated_at = $"+strconv.Itoa(index))
+	args = append(args, updatedAt.UTC().Format(time.RFC3339Nano))
+	index++
+	args = append(args, id)
+	_, err := r.db.ExecContext(
+		ctx,
+		`UPDATE users SET `+strings.Join(fields, ", ")+` WHERE id = $`+strconv.Itoa(index),
+		args...,
+	)
+	return err
+}
+
 func scanUserRecord(scanner interface {
 	Scan(dest ...any) error
 }) (UserRecord, error) {
@@ -166,6 +260,7 @@ func scanUserRecord(scanner interface {
 		&record.Username,
 		&record.PasswordHash,
 		&record.Role,
+		&record.Enabled,
 		&lastLoginAt,
 		&createdAt,
 		&updatedAt,

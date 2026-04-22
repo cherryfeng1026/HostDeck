@@ -23,11 +23,16 @@ type StatusWriter interface {
 	AppendHistory(ctx context.Context, serverID int64, snapshot collector.Snapshot, sampledAt time.Time) error
 }
 
+type AlertEvaluator interface {
+	EvaluateServerSnapshot(ctx context.Context, server domain.Server, snapshot collector.Snapshot, sampledAt time.Time) error
+}
+
 type Poller struct {
 	servers     ServerLister
 	resolver    ServerResolver
 	collector   *collector.SSHCollector
 	statuses    StatusWriter
+	alerts      AlertEvaluator
 	interval    time.Duration
 	concurrency int
 }
@@ -37,6 +42,7 @@ func NewPoller(
 	resolver ServerResolver,
 	collector *collector.SSHCollector,
 	statuses StatusWriter,
+	alerts AlertEvaluator,
 	interval time.Duration,
 	concurrency int,
 ) *Poller {
@@ -48,6 +54,7 @@ func NewPoller(
 		resolver:    resolver,
 		collector:   collector,
 		statuses:    statuses,
+		alerts:      alerts,
 		interval:    interval,
 		concurrency: concurrency,
 	}
@@ -104,6 +111,9 @@ func (p *Poller) collectOnce(ctx context.Context) {
 			now := time.Now()
 			_ = p.statuses.UpsertLatest(ctx, server.ID, snapshot, now)
 			_ = p.statuses.AppendHistory(ctx, server.ID, snapshot, now)
+			if p.alerts != nil {
+				_ = p.alerts.EvaluateServerSnapshot(ctx, resolvedServer, snapshot, now)
+			}
 		}(server)
 	}
 

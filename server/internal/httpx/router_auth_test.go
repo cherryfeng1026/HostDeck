@@ -38,7 +38,7 @@ func (s stubSessionAuthenticator) AuthenticateAPIToken(ctx context.Context, toke
 
 func TestRouterAuth_ReadRoutesAllowViewer(t *testing.T) {
 	serverHandler := api.NewServerHandler(viewerServerStore{}, viewerLiveServerLister{})
-	alertHandler := api.NewAlertHandler(service.NewAlertService(viewerAlertRuleStore{}, viewerAlertStateStore{}, viewerAlertServerStore{}))
+	alertHandler := api.NewAlertHandler(service.NewAlertService(viewerAlertRuleStore{}, viewerAlertStateStore{}, viewerAlertServerStore{}, nil))
 	commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}))
 	router := httpx.NewRouterWithHandlers(
 		serverHandler,
@@ -65,7 +65,7 @@ func TestRouterAuth_ReadRoutesAllowViewer(t *testing.T) {
 
 func TestRouterAuth_WriteRoutesBlockViewer(t *testing.T) {
 	serverHandler := api.NewServerHandler(viewerServerStore{}, viewerLiveServerLister{})
-	alertHandler := api.NewAlertHandler(service.NewAlertService(viewerAlertRuleStore{}, viewerAlertStateStore{}, viewerAlertServerStore{}))
+	alertHandler := api.NewAlertHandler(service.NewAlertService(viewerAlertRuleStore{}, viewerAlertStateStore{}, viewerAlertServerStore{}, nil))
 	commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}))
 	router := httpx.NewRouterWithHandlers(
 		serverHandler,
@@ -85,6 +85,7 @@ func TestRouterAuth_WriteRoutesBlockViewer(t *testing.T) {
 		body   string
 	}{
 		{method: http.MethodGet, path: "/api/commands/history"},
+		{method: http.MethodGet, path: "/api/alert-notification-settings"},
 		{method: http.MethodPost, path: "/api/servers", body: `{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.21","username":"root","authType":"password","password":"super-secret"}`},
 		{method: http.MethodPost, path: "/api/alert-rules", body: `{"metric":"memory_usage","operator":"gte","threshold":70,"durationSeconds":60,"enabled":true}`},
 	}

@@ -19,10 +19,11 @@ func NewSSHCollector(runner sshx.Runner) *SSHCollector {
 
 func (c *SSHCollector) Collect(ctx context.Context, server domain.Server) (Snapshot, error) {
 	target := sshx.Target{
-		Host:     server.IP,
-		Port:     server.SSHPort,
-		Username: server.Username,
-		Password: server.Password,
+		Host:                      server.IP,
+		Port:                      server.SSHPort,
+		Username:                  server.Username,
+		Password:                  server.Password,
+		TrustedHostKeyFingerprint: server.TrustedHostKeyFingerprint,
 	}
 
 	cpuRaw, err := c.runCommand(ctx, target, "sh -c 'cat /proc/stat; sleep 1; cat /proc/stat'")

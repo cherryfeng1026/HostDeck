@@ -1,10 +1,17 @@
 import type {
   ActivityListResponse,
   AlertEvent,
+  AlertHistoryEvent,
+  AlertNotificationSettings,
   AlertRule,
   AuthResponse,
+  AuthStatusResponse,
   BatchCommandResponse,
+  CommandHistoryQuery,
+  CommandHistoryRecord,
   CommandResult,
+  CommandTemplate,
+  CommandTemplateListResponse,
   LiveServerItem,
   MetricsResponse,
   NotificationListResponse,
@@ -15,7 +22,13 @@ import type {
   ServerPayload,
   ServerStatusDetail,
   TestSSHResponse,
+  User,
   UserListResponse,
+  CreateUserPayload,
+  UpdateUserPayload,
+  APITokenListResponse,
+  CreateAPITokenPayload,
+  CreateAPITokenResponse,
 } from '../types'
 
 export class APIError extends Error {
@@ -98,6 +111,13 @@ export function probeServer(id: number) {
   })
 }
 
+export function trustServerHostKey(id: number, fingerprint: string) {
+  return request<{ trustedHostKeyFingerprint: string }>(`/api/servers/${id}/trust-host-key`, {
+    method: 'POST',
+    body: JSON.stringify({ fingerprint }),
+  })
+}
+
 export function createServer(payload: ServerPayload) {
   return request<void>('/api/servers', {
     method: 'POST',
@@ -134,8 +154,52 @@ export function executeCommands(serverIds: number[], command: string, timeoutSec
   })
 }
 
+export function getCommandTemplates() {
+  return request<CommandTemplateListResponse>('/api/commands/templates')
+}
+
+export function getCommandHistory(query: CommandHistoryQuery = {}) {
+  const params = new URLSearchParams()
+  if (query.limit) params.set('limit', String(query.limit))
+  if (query.serverId) params.set('serverId', String(query.serverId))
+  if (query.executorUsername?.trim()) params.set('executorUsername', query.executorUsername.trim())
+  if (query.keyword?.trim()) params.set('keyword', query.keyword.trim())
+  if (query.startTime?.trim()) params.set('startTime', query.startTime.trim())
+  if (query.endTime?.trim()) params.set('endTime', query.endTime.trim())
+  const suffix = params.toString() ? `?${params.toString()}` : ''
+  return request<CommandHistoryRecord[]>(`/api/commands/history${suffix}`)
+}
+
 export function getAlerts() {
   return request<AlertEvent[]>('/api/alerts')
+}
+
+export function getAlertHistory(limit = 50) {
+  return request<AlertHistoryEvent[]>(`/api/alert-history?limit=${limit}`)
+}
+
+export function getAlertNotificationSettings() {
+  return request<AlertNotificationSettings>('/api/alert-notification-settings')
+}
+
+export function updateAlertNotificationSettings(payload: AlertNotificationSettings) {
+  return request<AlertNotificationSettings>('/api/alert-notification-settings', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function ackAlert(id: number) {
+  return request<AlertEvent>(`/api/alerts/${id}/ack`, {
+    method: 'POST',
+  })
+}
+
+export function muteAlert(id: number, durationMinutes = 30) {
+  return request<AlertEvent>(`/api/alerts/${id}/mute`, {
+    method: 'POST',
+    body: JSON.stringify({ durationMinutes }),
+  })
 }
 
 export function getAlertRules() {
@@ -154,6 +218,10 @@ export function updateAlertRule(id: number, payload: Omit<AlertRule, 'id' | 'cre
     method: 'PUT',
     body: JSON.stringify(payload),
   })
+}
+
+export function getAuthStatus() {
+  return request<AuthStatusResponse>('/api/auth/status')
 }
 
 export function login(username: string, password: string) {
@@ -184,8 +252,59 @@ export function getUsers() {
   return request<UserListResponse>('/api/users')
 }
 
+export function createUser(payload: CreateUserPayload) {
+  return request<User>('/api/users', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function updateUser(id: number, payload: UpdateUserPayload) {
+  return request<User>(`/api/users/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function resetUserPassword(id: number, newPassword: string) {
+  return request<void>(`/api/users/${id}/reset-password`, {
+    method: 'POST',
+    body: JSON.stringify({ newPassword }),
+  })
+}
+
+export function revokeUserSessions(id: number) {
+  return request<void>(`/api/users/${id}/revoke-sessions`, {
+    method: 'POST',
+  })
+}
+
+export function getAPITokens() {
+  return request<APITokenListResponse>('/api/auth/api-tokens')
+}
+
+export function createAPIToken(payload: CreateAPITokenPayload) {
+  return request<CreateAPITokenResponse>('/api/auth/api-tokens', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function revokeAPIToken(id: number) {
+  return request<void>(`/api/auth/api-tokens/${id}`, {
+    method: 'DELETE',
+  })
+}
+
 export function getNotifications(limit = 20) {
   return request<NotificationListResponse>(`/api/notifications?limit=${limit}`)
+}
+
+export function markNotificationsRead(readBefore: string) {
+  return request<void>('/api/notifications/read', {
+    method: 'POST',
+    body: JSON.stringify({ readBefore }),
+  })
 }
 
 export function getActivityFeed(limit = 20) {

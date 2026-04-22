@@ -194,8 +194,11 @@ func TestCommandRoutes_ExecuteReturnsResult(t *testing.T) {
 	if audits[0].Kind != domain.AuditKindCommand || audits[0].Title != "执行命令" {
 		t.Fatalf("unexpected audit event: %+v", audits[0])
 	}
-	if audits[0].ServerID != 1 || !strings.Contains(audits[0].Summary, "df -h") {
+	if audits[0].ServerID != 1 || audits[0].Summary != "命令执行成功" {
 		t.Fatalf("unexpected audit payload: %+v", audits[0])
+	}
+	if strings.Contains(audits[0].Summary, "df -h") {
+		t.Fatalf("expected audit summary to redact command text, got %+v", audits[0])
 	}
 }
 

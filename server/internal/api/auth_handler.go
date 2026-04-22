@@ -6,12 +6,15 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"hostdeck/server/internal/authctx"
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/service"
+	"hostdeck/server/internal/storage"
 )
 
 type AuthHandler struct {
@@ -31,6 +34,26 @@ type changePasswordPayload struct {
 	NewPassword     string `json:"newPassword"`
 }
 
+type createUserPayload struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Role     string `json:"role"`
+}
+
+type updateUserPayload struct {
+	Role    string `json:"role"`
+	Enabled bool   `json:"enabled"`
+}
+
+type resetUserPasswordPayload struct {
+	NewPassword string `json:"newPassword"`
+}
+
+type createAPITokenPayload struct {
+	Name           string `json:"name"`
+	ExpiresInHours int    `json:"expiresInHours"`
+}
+
 func NewAuthHandler(service *service.AuthService, cookieName string, cookieSecure bool, bootstrapToken string) *AuthHandler {
 	return &AuthHandler{
 		service:        service,
@@ -45,6 +68,7 @@ func RegisterPublicAuthRoutes(r chi.Router, h *AuthHandler) {
 		return
 	}
 
+	r.Get("/api/auth/status", h.Status)
 	r.Post("/api/auth/login", h.Login)
 	r.Post("/api/auth/logout", h.Logout)
 	r.Post("/api/auth/bootstrap-admin", h.BootstrapAdmin)
@@ -57,6 +81,26 @@ func RegisterProtectedAuthRoutes(r chi.Router, h *AuthHandler) {
 
 	r.Get("/api/auth/me", h.CurrentUser)
 	r.Post("/api/auth/change-password", h.ChangePassword)
+	r.Get("/api/auth/api-tokens", h.ListAPITokens)
+	r.Post("/api/auth/api-tokens", h.CreateAPIToken)
+	r.Delete("/api/auth/api-tokens/{id}", h.RevokeAPIToken)
+	r.Get("/api/users", h.ListUsers)
+	r.Post("/api/users", h.CreateUser)
+	r.Put("/api/users/{id}", h.UpdateUser)
+	r.Post("/api/users/{id}/reset-password", h.ResetUserPassword)
+	r.Post("/api/users/{id}/revoke-sessions", h.RevokeUserSessions)
+}
+
+func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
+	initialized, err := h.service.IsInitialized(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"initialized":      initialized,
+		"bootstrapEnabled": h.bootstrapToken != "",
+	})
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
@@ -69,8 +113,13 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	user, token, expiresAt, err := h.service.Login(r.Context(), payload.Username, payload.Password, clientIP(r), r.UserAgent())
 	if err != nil {
 		status := http.StatusUnauthorized
-		if errors.Is(err, service.ErrTooManyLoginAttempts) {
+		switch {
+		case errors.Is(err, service.ErrTooManyLoginAttempts):
 			status = http.StatusTooManyRequests
+		case errors.Is(err, service.ErrSystemUninitialized):
+			status = http.StatusPreconditionFailed
+		case errors.Is(err, service.ErrUserDisabled):
+			status = http.StatusForbidden
 		}
 		writeError(w, status, err)
 		return
@@ -96,6 +145,144 @@ func (h *AuthHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (h *AuthHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.currentUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	payload, err := decodeCreateUserPayload(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	user, err := h.service.CreateUser(r.Context(), actor, payload.Username, payload.Password, payload.Role, clientIP(r), r.UserAgent())
+	if err != nil {
+		writeUserManagementError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, user)
+}
+
+func (h *AuthHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.currentUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	userID, err := parseUserID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	payload, err := decodeUpdateUserPayload(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	user, err := h.service.UpdateUser(r.Context(), actor, userID, payload.Role, payload.Enabled, clientIP(r), r.UserAgent())
+	if err != nil {
+		writeUserManagementError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, user)
+}
+
+func (h *AuthHandler) ResetUserPassword(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.currentUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	userID, err := parseUserID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	payload, err := decodeResetUserPasswordPayload(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.service.ResetUserPassword(r.Context(), actor, userID, payload.NewPassword, clientIP(r), r.UserAgent()); err != nil {
+		writeUserManagementError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *AuthHandler) RevokeUserSessions(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.currentUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	userID, err := parseUserID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.service.RevokeUserSessions(r.Context(), actor, userID, clientIP(r), r.UserAgent()); err != nil {
+		writeUserManagementError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *AuthHandler) ListAPITokens(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.currentUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	items, err := h.service.ListAPITokens(r.Context(), actor)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (h *AuthHandler) CreateAPIToken(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.currentUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	payload, err := decodeCreateAPITokenPayload(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	item, plainToken, err := h.service.CreateAPIToken(r.Context(), actor, payload.Name, payload.ExpiresInHours, clientIP(r), r.UserAgent())
+	if err != nil {
+		writeUserManagementError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"token": plainToken,
+		"item":  item,
+	})
+}
+
+func (h *AuthHandler) RevokeAPIToken(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.currentUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	tokenID, err := parseUserID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.service.RevokeAPIToken(r.Context(), actor, tokenID, clientIP(r), r.UserAgent()); err != nil {
+		writeUserManagementError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
@@ -173,8 +360,8 @@ func authResponse(user domain.User) map[string]any {
 		"user": user,
 		"permissions": map[string]bool{
 			"canManageInfrastructure": domain.CanManageInfrastructure(user.Role),
-			"canManageUsers":         domain.CanManageUsers(user.Role),
-			"canChangeOwnPassword":   true,
+			"canManageUsers":          domain.CanManageUsers(user.Role),
+			"canChangeOwnPassword":    true,
 		},
 	}
 }
@@ -203,12 +390,80 @@ func decodeChangePasswordPayload(r *http.Request) (changePasswordPayload, error)
 	return payload, nil
 }
 
+func decodeCreateUserPayload(r *http.Request) (createUserPayload, error) {
+	defer r.Body.Close()
+
+	var payload createUserPayload
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return createUserPayload{}, err
+	}
+	return payload, nil
+}
+
+func decodeUpdateUserPayload(r *http.Request) (updateUserPayload, error) {
+	defer r.Body.Close()
+
+	var payload updateUserPayload
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return updateUserPayload{}, err
+	}
+	return payload, nil
+}
+
+func decodeResetUserPasswordPayload(r *http.Request) (resetUserPasswordPayload, error) {
+	defer r.Body.Close()
+
+	var payload resetUserPasswordPayload
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return resetUserPasswordPayload{}, err
+	}
+	return payload, nil
+}
+
+func decodeCreateAPITokenPayload(r *http.Request) (createAPITokenPayload, error) {
+	defer r.Body.Close()
+
+	var payload createAPITokenPayload
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return createAPITokenPayload{}, err
+	}
+	return payload, nil
+}
+
+func parseUserID(r *http.Request) (int64, error) {
+	return strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+}
+
+func writeUserManagementError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	switch {
+	case errors.Is(err, service.ErrUserNotFound), errors.Is(err, service.ErrAPITokenNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, service.ErrInvalidRole), errors.Is(err, service.ErrPasswordPolicy), errors.Is(err, service.ErrCannotDisableSelf), errors.Is(err, service.ErrCannotChangeOwnRole), errors.Is(err, service.ErrLastEnabledAdminRequired):
+		status = http.StatusBadRequest
+	case errors.Is(err, storage.ErrUserUsernameConflict):
+		status = http.StatusConflict
+	}
+	writeError(w, status, err)
+}
+
 func (h *AuthHandler) currentUser(r *http.Request) (domain.User, error) {
+	if user, ok := authctx.CurrentUser(r.Context()); ok {
+		return user, nil
+	}
 	token, err := h.sessionTokenFromRequest(r)
 	if err != nil {
 		return domain.User{}, err
 	}
-	return h.service.Authenticate(r.Context(), token)
+	return h.service.AuthenticateSession(r.Context(), token)
 }
 
 func (h *AuthHandler) sessionTokenFromRequest(r *http.Request) (string, error) {

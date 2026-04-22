@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { NButton, NInput, NScrollbar, useMessage } from 'naive-ui'
+import { NButton, NInput, NScrollbar, useDialog, useMessage } from 'naive-ui'
 import { onMounted, ref } from 'vue'
 import ServerModal from '../components/ServerModal.vue'
 import ServerStatusTable from '../components/ServerStatusTable.vue'
-import { getServerListWithStatus, probeServer, testServerSSH } from '../services/api'
+import { getServerListWithStatus, probeServer, testServerSSH, trustServerHostKey } from '../services/api'
 import { useSession } from '../session'
-import type { ServerAsset, ServerListItem } from '../types'
+import type { ServerAsset, ServerListItem, TestSSHResponse } from '../types'
 
 const message = useMessage()
+const dialog = useDialog()
 const { canManageInfrastructure } = useSession()
 const loading = ref(false)
 const search = ref('')
@@ -36,12 +37,35 @@ async function handleProbe(serverId: number) {
   }
 }
 
+function showSSHResult(serverId: number, result: TestSSHResponse) {
+  const canTrustHostKey = Boolean(
+    result.hostKeyFingerprint && (result.fingerprintMismatch || (result.sshOk && result.hostKeyFingerprint !== result.trustedHostKeyFingerprint)),
+  )
+  if (canTrustHostKey) {
+    dialog.warning({
+      title: result.fingerprintMismatch ? 'SSH 指纹不匹配' : '发现 SSH 主机指纹',
+      content: `${result.error || '请确认该主机指纹是否可信'}\n\n当前指纹：${result.hostKeyFingerprint}${result.trustedHostKeyFingerprint ? `\n已信任：${result.trustedHostKeyFingerprint}` : ''}`,
+      positiveText: '信任并保存',
+      negativeText: result.sshOk ? '稍后处理' : '取消',
+      onPositiveClick: async () => {
+        await trustServerHostKey(serverId, result.hostKeyFingerprint!)
+        message.success(result.sshOk ? '已保存 SSH 主机指纹，后续连接将强制校验' : '已保存 SSH 主机指纹')
+        await loadData()
+      },
+    })
+    return
+  }
+  if (result.sshOk) {
+    message.success(`SSH 连接正常，耗时 ${result.latencyMs ?? 0} ms`)
+    return
+  }
+  message.warning(result.error || 'SSH 连接异常')
+}
+
 async function handleTestSSH(serverId: number) {
   try {
     const result = await testServerSSH(serverId)
-    message[result.sshOk ? 'success' : 'warning'](
-      result.sshOk ? `SSH 连接正常，耗时 ${result.latencyMs} ms` : result.error || 'SSH 连接异常',
-    )
+    showSSHResult(serverId, result)
   } catch (error) {
     message.error(error instanceof Error ? error.message : 'SSH 测试失败')
   }
@@ -59,11 +83,6 @@ function openEditModal(server: ServerListItem) {
 
 function handleSubmitted() {
   editingServer.value = null
-  void loadData()
-}
-
-function clearSearch() {
-  search.value = ''
   void loadData()
 }
 

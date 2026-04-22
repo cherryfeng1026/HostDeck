@@ -9,11 +9,13 @@ import (
 	"strings"
 	"time"
 
+	"hostdeck/server/internal/credential"
 	"hostdeck/server/internal/domain"
 )
 
 type AlertRepository struct {
-	db *sql.DB
+	db        *sql.DB
+	masterKey string
 }
 
 var ErrAlertActionNotAllowed = errors.New("当前告警状态不支持该操作")
@@ -78,8 +80,12 @@ type AlertMutationRecord struct {
 	Detail        string
 }
 
-func NewAlertRepository(db *sql.DB) *AlertRepository {
-	return &AlertRepository{db: db}
+func NewAlertRepository(db *sql.DB, masterKey ...string) *AlertRepository {
+	repo := &AlertRepository{db: db}
+	if len(masterKey) > 0 {
+		repo.masterKey = strings.TrimSpace(masterKey[0])
+	}
+	return repo
 }
 
 func (r *AlertRepository) List(ctx context.Context) ([]domain.AlertRule, error) {
@@ -548,23 +554,55 @@ func (r *AlertRepository) ListCurrentStates(ctx context.Context) ([]domain.Alert
 }
 
 func (r *AlertRepository) ListHistory(ctx context.Context, limit int) ([]domain.AlertHistoryEvent, error) {
-	if limit <= 0 {
-		limit = 50
+	return r.listHistory(ctx, normalizeAlertHistoryLimit(limit), "", nil)
+}
+
+func (r *AlertRepository) ListHistoryByTypes(ctx context.Context, limit int, eventTypes ...string) ([]domain.AlertHistoryEvent, error) {
+	return r.listHistory(ctx, normalizeAlertHistoryLimit(limit), "", eventTypes)
+}
+
+func (r *AlertRepository) SearchHistory(ctx context.Context, query string, limit int, eventTypes ...string) ([]domain.AlertHistoryEvent, error) {
+	return r.listHistory(ctx, normalizeAlertHistoryLimit(limit), strings.TrimSpace(query), eventTypes)
+}
+
+func (r *AlertRepository) listHistory(ctx context.Context, limit int, query string, eventTypes []string) ([]domain.AlertHistoryEvent, error) {
+	args := []any{}
+	clauses := make([]string, 0, 2)
+
+	eventTypes = normalizeAlertHistoryEventTypes(eventTypes)
+	if len(eventTypes) > 0 {
+		placeholders := make([]string, 0, len(eventTypes))
+		for _, eventType := range eventTypes {
+			args = append(args, eventType)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		clauses = append(clauses, fmt.Sprintf("h.event_type IN (%s)", strings.Join(placeholders, ", ")))
 	}
-	if limit > 200 {
-		limit = 200
+
+	if query != "" {
+		args = append(args, "%"+strings.ToLower(query)+"%")
+		placeholder := fmt.Sprintf("$%d", len(args))
+		clauses = append(clauses, fmt.Sprintf(`(
+			LOWER(COALESCE(s.name, '')) LIKE %s OR
+			LOWER(h.message) LIKE %s OR
+			LOWER(h.metric) LIKE %s OR
+			LOWER(h.detail) LIKE %s OR
+			LOWER(h.actor_username) LIKE %s
+		)`, placeholder, placeholder, placeholder, placeholder, placeholder))
 	}
-	rows, err := r.db.QueryContext(
-		ctx,
-		`SELECT h.id, h.alert_id, h.rule_id, h.server_id, COALESCE(s.name, ''), h.event_type, h.metric,
-		        h.operator, h.threshold, h.current_value, h.severity, h.message, h.status,
-		        h.triggered_at, h.created_at, h.actor_username, h.detail
-		   FROM alert_history h
-		   LEFT JOIN servers s ON s.id = h.server_id
-		  ORDER BY h.created_at DESC, h.id DESC
-		  LIMIT $1`,
-		limit,
-	)
+
+	statement := `SELECT h.id, h.alert_id, h.rule_id, h.server_id, COALESCE(s.name, ''), h.event_type, h.metric,
+	        h.operator, h.threshold, h.current_value, h.severity, h.message, h.status,
+	        h.triggered_at, h.created_at, h.actor_username, h.detail
+	   FROM alert_history h
+	   LEFT JOIN servers s ON s.id = h.server_id`
+	if len(clauses) > 0 {
+		statement += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	args = append(args, limit)
+	statement += fmt.Sprintf(" ORDER BY h.created_at DESC, h.id DESC LIMIT $%d", len(args))
+
+	rows, err := r.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -581,6 +619,36 @@ func (r *AlertRepository) ListHistory(ctx context.Context, limit int) ([]domain.
 	return items, rows.Err()
 }
 
+func normalizeAlertHistoryLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+func normalizeAlertHistoryEventTypes(eventTypes []string) []string {
+	if len(eventTypes) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(eventTypes))
+	seen := make(map[string]struct{}, len(eventTypes))
+	for _, eventType := range eventTypes {
+		value := strings.TrimSpace(eventType)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		filtered = append(filtered, value)
+	}
+	return filtered
+}
+
 func (r *AlertRepository) DeleteHistoryBefore(ctx context.Context, cutoff time.Time) error {
 	_, err := r.db.ExecContext(
 		ctx,
@@ -588,6 +656,99 @@ func (r *AlertRepository) DeleteHistoryBefore(ctx context.Context, cutoff time.T
 		cutoff.UTC().Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func (r *AlertRepository) GetNotificationSettings(ctx context.Context) (domain.AlertNotificationSettings, error) {
+	row := r.db.QueryRowContext(
+		ctx,
+		`SELECT enabled, webhook_url, webhook_timeout_seconds, created_at, updated_at
+		   FROM alert_notification_settings
+		  WHERE singleton = 1`,
+	)
+	settings, err := scanOptionalAlertNotificationSettings(row)
+	if err != nil {
+		return domain.AlertNotificationSettings{}, err
+	}
+	if settings.WebhookTimeoutSeconds <= 0 {
+		settings.WebhookTimeoutSeconds = 5
+	}
+	settings.WebhookURL = strings.TrimSpace(settings.WebhookURL)
+	if settings.WebhookURL != "" {
+		decrypted, err := r.decryptNotificationWebhookURL(settings.WebhookURL)
+		if err != nil {
+			return domain.AlertNotificationSettings{}, err
+		}
+		settings.WebhookURL = decrypted
+		settings.WebhookConfigured = true
+		return settings, nil
+	}
+	settings.WebhookConfigured = false
+	return settings, nil
+}
+
+func (r *AlertRepository) SaveNotificationSettings(ctx context.Context, settings domain.AlertNotificationSettings) (domain.AlertNotificationSettings, error) {
+	settings.WebhookURL = strings.TrimSpace(settings.WebhookURL)
+	if settings.WebhookTimeoutSeconds <= 0 {
+		settings.WebhookTimeoutSeconds = 5
+	}
+
+	storedWebhookURL, err := r.encryptNotificationWebhookURL(settings.WebhookURL)
+	if err != nil {
+		return domain.AlertNotificationSettings{}, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = r.db.ExecContext(
+		ctx,
+		`INSERT INTO alert_notification_settings (singleton, enabled, webhook_url, webhook_timeout_seconds, created_at, updated_at)
+		 VALUES (1, $1, $2, $3, $4, $4)
+		 ON CONFLICT (singleton) DO UPDATE
+		 SET enabled = EXCLUDED.enabled,
+		     webhook_url = EXCLUDED.webhook_url,
+		     webhook_timeout_seconds = EXCLUDED.webhook_timeout_seconds,
+		     updated_at = EXCLUDED.updated_at`,
+		boolToInt(settings.Enabled),
+		storedWebhookURL,
+		settings.WebhookTimeoutSeconds,
+		now,
+	)
+	if err != nil {
+		return domain.AlertNotificationSettings{}, err
+	}
+	return r.GetNotificationSettings(ctx)
+}
+
+func (r *AlertRepository) encryptNotificationWebhookURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(r.masterKey) == "" {
+		return "", errors.New("master_key 未配置，无法加密通知 Webhook")
+	}
+	cipher, err := credential.NewCipher(r.masterKey)
+	if err != nil {
+		return "", err
+	}
+	return cipher.Encrypt(value)
+}
+
+func (r *AlertRepository) decryptNotificationWebhookURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		return value, nil
+	}
+	if strings.TrimSpace(r.masterKey) == "" {
+		return "", errors.New("master_key 未配置，无法解密通知 Webhook")
+	}
+	cipher, err := credential.NewCipher(r.masterKey)
+	if err != nil {
+		return "", err
+	}
+	return cipher.Decrypt(value)
 }
 
 func insertAlertHistoryTx(ctx context.Context, tx *sql.Tx, event AlertMutationRecord) error {
@@ -665,6 +826,19 @@ func scanOptionalAlertState(scanner interface {
 	return item, nil
 }
 
+func scanOptionalAlertNotificationSettings(scanner interface {
+	Scan(dest ...any) error
+}) (domain.AlertNotificationSettings, error) {
+	item, err := scanAlertNotificationSettings(scanner)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.AlertNotificationSettings{}, nil
+		}
+		return domain.AlertNotificationSettings{}, err
+	}
+	return item, nil
+}
+
 func scanAlertState(scanner interface {
 	Scan(dest ...any) error
 }) (domain.AlertState, error) {
@@ -725,6 +899,35 @@ func scanAlertState(scanner interface {
 	}
 	if item.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt); err != nil {
 		return domain.AlertState{}, err
+	}
+	return item, nil
+}
+
+func scanAlertNotificationSettings(scanner interface {
+	Scan(dest ...any) error
+}) (domain.AlertNotificationSettings, error) {
+	var (
+		item      domain.AlertNotificationSettings
+		enabled   int
+		createdAt string
+		updatedAt string
+		err       error
+	)
+	if err = scanner.Scan(
+		&enabled,
+		&item.WebhookURL,
+		&item.WebhookTimeoutSeconds,
+		&createdAt,
+		&updatedAt,
+	); err != nil {
+		return domain.AlertNotificationSettings{}, err
+	}
+	item.Enabled = enabled == 1
+	if item.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return domain.AlertNotificationSettings{}, err
+	}
+	if item.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt); err != nil {
+		return domain.AlertNotificationSettings{}, err
 	}
 	return item, nil
 }

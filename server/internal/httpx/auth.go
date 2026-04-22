@@ -6,15 +6,13 @@ import (
 	"net/http"
 	"strings"
 
+	"hostdeck/server/internal/authctx"
 	"hostdeck/server/internal/domain"
 )
 
-type userContextKey string
-
-const currentUserKey userContextKey = "hostdeck_current_user"
-
 type SessionAuthenticator interface {
-	Authenticate(ctx context.Context, token string) (domain.User, error)
+	AuthenticateSession(ctx context.Context, token string) (domain.User, error)
+	AuthenticateAPIToken(ctx context.Context, token string) (domain.User, error)
 }
 
 func NewSessionAuthMiddleware(authenticator SessionAuthenticator, cookieName string) func(http.Handler) http.Handler {
@@ -26,32 +24,52 @@ func NewSessionAuthMiddleware(authenticator SessionAuthenticator, cookieName str
 		}
 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if authenticator == nil || cookieName == "" {
+			if authenticator == nil {
 				writeAuthError(w, http.StatusUnauthorized, "请先登录")
 				return
 			}
 
+			if token := bearerTokenFromRequest(r); token != "" {
+				user, err := authenticator.AuthenticateAPIToken(r.Context(), token)
+				if err != nil {
+					writeAuthError(w, http.StatusUnauthorized, "API Token 无效或已失效")
+					return
+				}
+				ctx := authctx.WithCurrentUser(r.Context(), user)
+				ctx = authctx.WithAuthMethod(ctx, authctx.AuthMethodAPIToken)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
+			if cookieName == "" {
+				writeAuthError(w, http.StatusUnauthorized, "请先登录")
+				return
+			}
 			cookie, err := r.Cookie(cookieName)
 			if err != nil || strings.TrimSpace(cookie.Value) == "" {
 				writeAuthError(w, http.StatusUnauthorized, "请先登录")
 				return
 			}
 
-			user, err := authenticator.Authenticate(r.Context(), cookie.Value)
+			user, err := authenticator.AuthenticateSession(r.Context(), cookie.Value)
 			if err != nil {
 				writeAuthError(w, http.StatusUnauthorized, "登录状态已失效")
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), currentUserKey, user)
+			ctx := authctx.WithCurrentUser(r.Context(), user)
+			ctx = authctx.WithAuthMethod(ctx, authctx.AuthMethodSession)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
 func CurrentUser(ctx context.Context) (domain.User, bool) {
-	user, ok := ctx.Value(currentUserKey).(domain.User)
-	return user, ok
+	return authctx.CurrentUser(ctx)
+}
+
+func CurrentAuthMethod(ctx context.Context) (authctx.AuthMethod, bool) {
+	return authctx.CurrentAuthMethod(ctx)
 }
 
 func RequireInfrastructureAccess(next http.Handler) http.Handler {
@@ -82,10 +100,35 @@ func RequireUserManagementAccess(next http.Handler) http.Handler {
 	})
 }
 
+func RequireSessionAuth(next http.Handler) http.Handler {
+	if next == nil {
+		next = http.NotFoundHandler()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, ok := CurrentAuthMethod(r.Context())
+		if !ok || method != authctx.AuthMethodSession {
+			writeAuthError(w, http.StatusForbidden, "API Token 不支持该操作")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func writeAuthError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"error": message,
 	})
+}
+
+func bearerTokenFromRequest(r *http.Request) string {
+	value := strings.TrimSpace(r.Header.Get("Authorization"))
+	if value == "" || len(value) < 8 {
+		return ""
+	}
+	if !strings.EqualFold(value[:7], "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(value[7:])
 }

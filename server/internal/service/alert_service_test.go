@@ -29,7 +29,7 @@ func TestEvaluateAlerts_OfflineRule(t *testing.T) {
 
 func TestCreateRule_PreservesDisabledState(t *testing.T) {
 	store := &alertRuleStoreStub{}
-	svc := service.NewAlertService(store, nil, nil)
+	svc := service.NewAlertService(store, nil, nil, nil)
 
 	err := svc.CreateRule(context.Background(), domain.AlertRule{
 		Metric:          "cpu_usage",
@@ -63,7 +63,7 @@ func TestAlertService_EvaluateServerSnapshotTransitionsPendingToActive(t *testin
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{})
+	}, stateStore, &alertServerStoreStub{}, nil)
 
 	snapshot := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 90, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, snapshot, now); err != nil {
@@ -142,7 +142,7 @@ func TestAlertService_EvaluateServerSnapshotResolvesRecoveredAlert(t *testing.T)
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{})
+	}, stateStore, &alertServerStoreStub{}, nil)
 
 	recovered := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 50, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, recovered, now); err != nil {
@@ -157,7 +157,7 @@ func TestAlertService_EvaluateServerSnapshotResolvesRecoveredAlert(t *testing.T)
 }
 
 func TestAlertService_AcknowledgeReturnsNotFound(t *testing.T) {
-	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{ackErr: sql.ErrNoRows}, &alertServerStoreStub{})
+	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{ackErr: sql.ErrNoRows}, &alertServerStoreStub{}, nil)
 	_, err := svc.AcknowledgeAlert(context.Background(), 99, "alice")
 	if !errors.Is(err, service.ErrAlertNotFound) {
 		t.Fatalf("expected ErrAlertNotFound, got %v", err)
@@ -165,10 +165,98 @@ func TestAlertService_AcknowledgeReturnsNotFound(t *testing.T) {
 }
 
 func TestAlertService_AcknowledgeReturnsConflictForInvalidState(t *testing.T) {
-	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{ackErr: storage.ErrAlertActionNotAllowed}, &alertServerStoreStub{})
+	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{ackErr: storage.ErrAlertActionNotAllowed}, &alertServerStoreStub{}, nil)
 	_, err := svc.AcknowledgeAlert(context.Background(), 99, "alice")
 	if !errors.Is(err, service.ErrAlertActionNotAllowed) {
 		t.Fatalf("expected ErrAlertActionNotAllowed, got %v", err)
+	}
+}
+
+func TestAlertService_GetNotificationSettingsReturnsDefaultWithoutStore(t *testing.T) {
+	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{}, &alertServerStoreStub{}, nil)
+	settings, err := svc.GetNotificationSettings(context.Background())
+	if err != nil {
+		t.Fatalf("get notification settings: %v", err)
+	}
+	if settings.Enabled {
+		t.Fatalf("expected notifications disabled by default, got %+v", settings)
+	}
+	if settings.WebhookTimeoutSeconds != 5 {
+		t.Fatalf("expected default timeout 5, got %+v", settings)
+	}
+}
+
+func TestAlertService_SaveNotificationSettingsValidatesEnabledWebhook(t *testing.T) {
+	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{}, &alertServerStoreStub{}, &alertNotificationSettingsStoreStub{})
+	_, err := svc.SaveNotificationSettings(context.Background(), domain.AlertNotificationSettings{Enabled: true})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+}
+
+func TestAlertService_SaveNotificationSettingsNormalizesTimeout(t *testing.T) {
+	settingsStore := &alertNotificationSettingsStoreStub{}
+	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{}, &alertServerStoreStub{}, settingsStore)
+	settings, err := svc.SaveNotificationSettings(context.Background(), domain.AlertNotificationSettings{
+		Enabled:    true,
+		WebhookURL: "https://hooks.example.test/alert",
+	})
+	if err != nil {
+		t.Fatalf("save notification settings: %v", err)
+	}
+	if settings.WebhookTimeoutSeconds != 5 {
+		t.Fatalf("expected default timeout 5, got %+v", settings)
+	}
+	if settingsStore.saved.WebhookURL != "https://hooks.example.test/alert" {
+		t.Fatalf("expected trimmed webhook url to be saved, got %+v", settingsStore.saved)
+	}
+}
+
+func TestAlertService_SaveNotificationSettingsRetainsExistingWebhookWhenBlank(t *testing.T) {
+	settingsStore := &alertNotificationSettingsStoreStub{settings: domain.AlertNotificationSettings{
+		Enabled:               true,
+		WebhookURL:            "https://hooks.example.test/existing",
+		WebhookTimeoutSeconds: 5,
+	}}
+	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{}, &alertServerStoreStub{}, settingsStore)
+	settings, err := svc.SaveNotificationSettings(context.Background(), domain.AlertNotificationSettings{
+		Enabled:               true,
+		WebhookTimeoutSeconds: 9,
+	})
+	if err != nil {
+		t.Fatalf("save notification settings: %v", err)
+	}
+	if settingsStore.saved.WebhookURL != "https://hooks.example.test/existing" {
+		t.Fatalf("expected existing webhook url to be preserved, got %+v", settingsStore.saved)
+	}
+	if !settings.WebhookConfigured {
+		t.Fatalf("expected webhookConfigured=true, got %+v", settings)
+	}
+}
+
+func TestAlertService_SaveNotificationSettingsClearsWebhookWhenRequested(t *testing.T) {
+	settingsStore := &alertNotificationSettingsStoreStub{settings: domain.AlertNotificationSettings{
+		Enabled:               true,
+		WebhookURL:            "https://hooks.example.test/existing",
+		WebhookTimeoutSeconds: 5,
+	}}
+	svc := service.NewAlertService(&alertRuleStoreStub{}, &alertStateStoreStub{}, &alertServerStoreStub{}, settingsStore)
+	settings, err := svc.SaveNotificationSettings(context.Background(), domain.AlertNotificationSettings{
+		Enabled:               false,
+		ClearWebhookURL:       true,
+		WebhookTimeoutSeconds: 7,
+	})
+	if err != nil {
+		t.Fatalf("save notification settings: %v", err)
+	}
+	if settingsStore.saved.WebhookURL != "" {
+		t.Fatalf("expected webhook url to be cleared, got %+v", settingsStore.saved)
+	}
+	if settingsStore.saved.WebhookConfigured {
+		t.Fatalf("expected webhookConfigured=false after clearing, got %+v", settingsStore.saved)
+	}
+	if settings.WebhookConfigured {
+		t.Fatalf("expected response webhookConfigured=false, got %+v", settings)
 	}
 }
 
@@ -204,7 +292,7 @@ func TestAlertService_EvaluateServerSnapshotKeepsAcknowledgedUntilRecovered(t *t
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{})
+	}, stateStore, &alertServerStoreStub{}, nil)
 
 	snapshot := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 90, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, snapshot, now); err != nil {
@@ -249,7 +337,7 @@ func TestAlertService_EvaluateServerSnapshotReactivatesExpiredMute(t *testing.T)
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{})
+	}, stateStore, &alertServerStoreStub{}, nil)
 
 	snapshot := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 90, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, snapshot, now); err != nil {
@@ -293,7 +381,7 @@ func TestAlertService_EvaluateServerSnapshotNotifiesTriggeredAlert(t *testing.T)
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{}, recorder)
+	}, stateStore, &alertServerStoreStub{}, nil, recorder)
 
 	snapshot := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 90, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, snapshot, now); err != nil {
@@ -340,7 +428,7 @@ func TestAlertService_EvaluateServerSnapshotNotifiesResolvedAlert(t *testing.T) 
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{}, recorder)
+	}, stateStore, &alertServerStoreStub{}, nil, recorder)
 
 	recovered := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 50, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, recovered, now); err != nil {
@@ -387,7 +475,7 @@ func TestAlertService_EvaluateServerSnapshotSkipsResolvedNotificationForPendingA
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{}, recorder)
+	}, stateStore, &alertServerStoreStub{}, nil, recorder)
 
 	recovered := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 50, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, recovered, now); err != nil {
@@ -430,7 +518,7 @@ func TestAlertService_EvaluateServerSnapshotSkipsResolvedNotificationForMutedAle
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{}, recorder)
+	}, stateStore, &alertServerStoreStub{}, nil, recorder)
 
 	recovered := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 50, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, recovered, now); err != nil {
@@ -478,7 +566,7 @@ func TestAlertService_EvaluateServerSnapshotSuppressesAlertsDuringMaintenanceWin
 			DurationSeconds: 60,
 			Enabled:         true,
 		}},
-	}, stateStore, &alertServerStoreStub{}, recorder)
+	}, stateStore, &alertServerStoreStub{}, nil, recorder)
 
 	snapshot := collector.Snapshot{Online: true, SSHOK: true, MemoryUsage: 95, Source: "ssh"}
 	if err := svc.EvaluateServerSnapshot(context.Background(), server, snapshot, now); err != nil {
@@ -544,6 +632,28 @@ type alertNotificationRecorder struct {
 func (r *alertNotificationRecorder) NotifyAlert(ctx context.Context, notification service.AlertNotification) error {
 	r.items = append(r.items, notification)
 	return nil
+}
+
+type alertNotificationSettingsStoreStub struct {
+	settings domain.AlertNotificationSettings
+	saved    domain.AlertNotificationSettings
+	err      error
+}
+
+func (s *alertNotificationSettingsStoreStub) GetNotificationSettings(context.Context) (domain.AlertNotificationSettings, error) {
+	if s.err != nil {
+		return domain.AlertNotificationSettings{}, s.err
+	}
+	return s.settings, nil
+}
+
+func (s *alertNotificationSettingsStoreStub) SaveNotificationSettings(_ context.Context, settings domain.AlertNotificationSettings) (domain.AlertNotificationSettings, error) {
+	if s.err != nil {
+		return domain.AlertNotificationSettings{}, s.err
+	}
+	s.saved = settings
+	s.settings = settings
+	return settings, nil
 }
 
 type alertStateStoreStub struct {

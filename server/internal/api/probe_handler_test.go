@@ -6,9 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
-
-	_ "modernc.org/sqlite"
 
 	"hostdeck/server/internal/api"
 	"hostdeck/server/internal/domain"
@@ -16,11 +15,14 @@ import (
 	"hostdeck/server/internal/service"
 	"hostdeck/server/internal/sshx"
 	"hostdeck/server/internal/storage"
+	"hostdeck/server/internal/testsupport"
 )
 
 type fakeRunner struct {
-	results map[string]fakeRunResult
-	targets []sshx.Target
+	results     map[string]fakeRunResult
+	targets     []sshx.Target
+	fingerprint string
+	err         error
 }
 
 type fakeRunResult struct {
@@ -39,9 +41,18 @@ func (f *fakeRunner) Run(ctx context.Context, target sshx.Target, command string
 	return result.stdout, result.stderr, result.exitCode, result.err
 }
 
+func (f *fakeRunner) GetHostKeyFingerprint(ctx context.Context, target sshx.Target) (string, error) {
+	f.targets = append(f.targets, target)
+	return f.fingerprint, f.err
+}
+
 type testSSHResponse struct {
-	SSHOK     bool  `json:"sshOk"`
-	LatencyMS int64 `json:"latencyMs"`
+	SSHOK                     bool   `json:"sshOk"`
+	LatencyMS                 int64  `json:"latencyMs"`
+	Error                     string `json:"error"`
+	HostKeyFingerprint        string `json:"hostKeyFingerprint"`
+	TrustedHostKeyFingerprint string `json:"trustedHostKeyFingerprint"`
+	FingerprintMismatch       bool   `json:"fingerprintMismatch"`
 }
 
 type probeResponse struct {
@@ -57,20 +68,7 @@ type probeResponse struct {
 
 func openProbeTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-
-	db, err := sql.Open("sqlite", "file:probe-handler-test?mode=memory&cache=shared")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := storage.Migrate(context.Background(), db); err != nil {
-		t.Fatalf("migrate db: %v", err)
-	}
-
-	return db
+	return testsupport.OpenPostgresTestDB(t)
 }
 
 func seedProbeServer(t *testing.T, repo *storage.ServerRepository) {
@@ -106,6 +104,7 @@ func TestProbeRoutes_TestSSHReturnsStatusAndLatency(t *testing.T) {
 		"test-master-key",
 	)
 	runner := &fakeRunner{
+		fingerprint: "SHA256:first-seen",
 		results: map[string]fakeRunResult{
 			"true": {exitCode: 0},
 		},
@@ -115,6 +114,7 @@ func TestProbeRoutes_TestSSHReturnsStatusAndLatency(t *testing.T) {
 		connectionService,
 		runner,
 		storage.NewStatusRepository(db),
+		nil,
 	)
 	router := httpx.NewRouterWithHandlers(api.NewServerHandler(serverRepo, nil), handler, nil, nil, nil, nil)
 
@@ -133,14 +133,20 @@ func TestProbeRoutes_TestSSHReturnsStatusAndLatency(t *testing.T) {
 	if !resp.SSHOK {
 		t.Fatalf("expected sshOk to be true")
 	}
+	if resp.HostKeyFingerprint != "SHA256:first-seen" {
+		t.Fatalf("unexpected hostKeyFingerprint: %q", resp.HostKeyFingerprint)
+	}
+	if resp.TrustedHostKeyFingerprint != "" {
+		t.Fatalf("unexpected trusted fingerprint: %q", resp.TrustedHostKeyFingerprint)
+	}
 	if resp.LatencyMS < 0 {
 		t.Fatalf("expected non-negative latency, got %d", resp.LatencyMS)
 	}
-	if len(runner.targets) != 1 {
-		t.Fatalf("expected one ssh target, got %d", len(runner.targets))
+	if len(runner.targets) != 2 {
+		t.Fatalf("expected fingerprint probe and ssh run targets, got %d", len(runner.targets))
 	}
-	if runner.targets[0].Password != "super-secret" {
-		t.Fatalf("expected decrypted password in ssh target, got %q", runner.targets[0].Password)
+	if runner.targets[0].Password != "super-secret" || runner.targets[1].Password != "super-secret" {
+		t.Fatalf("expected decrypted password in ssh targets, got %+v", runner.targets)
 	}
 }
 
@@ -156,12 +162,12 @@ func TestProbeRoutes_ProbePersistsLatestStatus(t *testing.T) {
 	runner := &fakeRunner{
 		results: map[string]fakeRunResult{
 			"sh -c 'cat /proc/stat; sleep 1; cat /proc/stat'": {stdout: "cpu  100 0 100 900 0 0 0 0 0 0\ncpu  140 0 140 940 0 0 0 0 0 0\n"},
-			"cat /proc/meminfo":                               {stdout: "MemTotal: 2048000 kB\nMemAvailable: 1024000 kB\n"},
-			"df -P /":                                         {stdout: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 100000 55000 45000 55% /\n"},
-			"cat /proc/loadavg":                               {stdout: "0.15 0.20 0.25 1/100 12345\n"},
-			"cat /etc/os-release":                             {stdout: "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\n"},
-			"uname -r":                                        {stdout: "6.8.0-31-generic\n"},
-			"cat /proc/uptime":                                {stdout: "12345.67 23456.78\n"},
+			"cat /proc/meminfo":   {stdout: "MemTotal: 2048000 kB\nMemAvailable: 1024000 kB\n"},
+			"df -P /":             {stdout: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 100000 55000 45000 55% /\n"},
+			"cat /proc/loadavg":   {stdout: "0.15 0.20 0.25 1/100 12345\n"},
+			"cat /etc/os-release": {stdout: "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\n"},
+			"uname -r":            {stdout: "6.8.0-31-generic\n"},
+			"cat /proc/uptime":    {stdout: "12345.67 23456.78\n"},
 		},
 	}
 
@@ -169,6 +175,7 @@ func TestProbeRoutes_ProbePersistsLatestStatus(t *testing.T) {
 		connectionService,
 		runner,
 		storage.NewStatusRepository(db),
+		nil,
 	)
 	router := httpx.NewRouterWithHandlers(api.NewServerHandler(serverRepo, nil), handler, nil, nil, nil, nil)
 
@@ -231,7 +238,7 @@ func TestProbeRoutes_DisabledServerReturnsConflict(t *testing.T) {
 		storage.NewServerCredentialRepository(db),
 		"test-master-key",
 	)
-	handler := api.NewProbeHandler(connectionService, &fakeRunner{}, storage.NewStatusRepository(db))
+	handler := api.NewProbeHandler(connectionService, &fakeRunner{}, storage.NewStatusRepository(db), nil)
 	router := httpx.NewRouterWithHandlers(api.NewServerHandler(serverRepo, nil), handler, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/servers/1/test-ssh", nil)
@@ -240,5 +247,123 @@ func TestProbeRoutes_DisabledServerReturnsConflict(t *testing.T) {
 
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected status %d, got %d", http.StatusConflict, rec.Code)
+	}
+}
+
+func TestProbeRoutes_TestSSHReturnsFingerprintMismatch(t *testing.T) {
+	db := openProbeTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seed := serverSeed()
+	seed.TrustedHostKeyFingerprint = "SHA256:trusted"
+	if err := serverRepo.Create(context.Background(), seed); err != nil {
+		t.Fatalf("seed server: %v", err)
+	}
+
+	connectionService := service.NewServerConnectionService(
+		serverRepo,
+		storage.NewServerCredentialRepository(db),
+		"test-master-key",
+	)
+	runner := &fakeRunner{
+		fingerprint: "SHA256:actual",
+		err:         sshx.HostKeyMismatchError{Expected: "SHA256:trusted", Actual: "SHA256:actual"},
+		results: map[string]fakeRunResult{
+			"true": {exitCode: 0},
+		},
+	}
+
+	handler := api.NewProbeHandler(connectionService, runner, storage.NewStatusRepository(db), nil)
+	router := httpx.NewRouterWithHandlers(api.NewServerHandler(serverRepo, nil), handler, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/1/test-ssh", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	var resp testSSHResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.SSHOK {
+		t.Fatal("expected sshOk to be false")
+	}
+	if !resp.FingerprintMismatch {
+		t.Fatal("expected fingerprintMismatch to be true")
+	}
+	if resp.HostKeyFingerprint != "SHA256:actual" {
+		t.Fatalf("unexpected hostKeyFingerprint: %q", resp.HostKeyFingerprint)
+	}
+	if resp.TrustedHostKeyFingerprint != "SHA256:trusted" {
+		t.Fatalf("unexpected trustedHostKeyFingerprint: %q", resp.TrustedHostKeyFingerprint)
+	}
+	if !strings.Contains(resp.Error, "SSH 主机指纹不匹配") {
+		t.Fatalf("unexpected error: %q", resp.Error)
+	}
+}
+
+func TestProbeRoutes_TrustHostKeyPersistsFingerprint(t *testing.T) {
+	db := openProbeTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seedProbeServer(t, serverRepo)
+	connectionService := service.NewServerConnectionService(
+		serverRepo,
+		storage.NewServerCredentialRepository(db),
+		"test-master-key",
+	)
+	handler := api.NewProbeHandler(connectionService, &fakeRunner{}, storage.NewStatusRepository(db), nil)
+	router := httpx.NewRouterWithHandlers(api.NewServerHandler(serverRepo, nil), handler, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/1/trust-host-key", strings.NewReader(`{"fingerprint":"  SHA256:new-fingerprint  "}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	var resp struct {
+		TrustedHostKeyFingerprint string `json:"trustedHostKeyFingerprint"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.TrustedHostKeyFingerprint != "SHA256:new-fingerprint" {
+		t.Fatalf("unexpected response fingerprint: %q", resp.TrustedHostKeyFingerprint)
+	}
+
+	servers, err := serverRepo.List(context.Background(), storage.ServerFilter{ID: 1})
+	if err != nil {
+		t.Fatalf("list servers: %v", err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("expected one server, got %d", len(servers))
+	}
+	if servers[0].TrustedHostKeyFingerprint != "SHA256:new-fingerprint" {
+		t.Fatalf("unexpected persisted fingerprint: %q", servers[0].TrustedHostKeyFingerprint)
+	}
+}
+
+func TestProbeRoutes_TrustHostKeyReturnsNotFound(t *testing.T) {
+	db := openProbeTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	connectionService := service.NewServerConnectionService(
+		serverRepo,
+		storage.NewServerCredentialRepository(db),
+		"test-master-key",
+	)
+	handler := api.NewProbeHandler(connectionService, &fakeRunner{}, storage.NewStatusRepository(db), nil)
+	router := httpx.NewRouterWithHandlers(api.NewServerHandler(serverRepo, nil), handler, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/999/trust-host-key", strings.NewReader(`{"fingerprint":"SHA256:new-fingerprint"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, rec.Code)
 	}
 }

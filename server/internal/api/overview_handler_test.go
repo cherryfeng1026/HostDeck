@@ -10,14 +10,13 @@ import (
 	"testing"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"hostdeck/server/internal/api"
 	"hostdeck/server/internal/collector"
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/httpx"
 	"hostdeck/server/internal/service"
 	"hostdeck/server/internal/storage"
+	"hostdeck/server/internal/testsupport"
 )
 
 type overviewResponse struct {
@@ -49,20 +48,7 @@ type metricsResponse struct {
 
 func openOverviewTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-
-	db, err := sql.Open("sqlite", "file:overview-handler-test?mode=memory&cache=shared")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := storage.Migrate(context.Background(), db); err != nil {
-		t.Fatalf("migrate db: %v", err)
-	}
-
-	return db
+	return testsupport.OpenPostgresTestDB(t)
 }
 
 func seedOverviewData(t *testing.T, serverRepo *storage.ServerRepository, statusRepo *storage.StatusRepository) {
@@ -129,7 +115,8 @@ func TestOverviewRoutes_ReturnOverviewStatusAndMetrics(t *testing.T) {
 	statusRepo := storage.NewStatusRepository(db)
 	seedOverviewData(t, serverRepo, statusRepo)
 
-	alertService := service.NewAlertService(storage.NewAlertRepository(db), serverRepo, statusRepo)
+	alertRepo := storage.NewAlertRepository(db)
+	alertService := service.NewAlertService(alertRepo, alertRepo, serverRepo, alertRepo)
 	svc := service.NewOverviewService(serverRepo, statusRepo, alertService)
 	serverViewService := service.NewServerViewService(serverRepo, statusRepo)
 	router := httpx.NewRouterWithHandlers(

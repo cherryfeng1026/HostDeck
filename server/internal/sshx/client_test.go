@@ -2,8 +2,13 @@ package sshx
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"io"
+	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 type fakeClient struct {
@@ -109,5 +114,58 @@ func TestClientRunReturnsRemoteExitCode(t *testing.T) {
 	}
 	if exitCode != 127 {
 		t.Fatalf("expected exit code 127, got %d", exitCode)
+	}
+}
+
+func TestHostKeyCaptureAcceptsMatchingFingerprint(t *testing.T) {
+	publicKey := newTestPublicKey(t)
+	fingerprint := ssh.FingerprintSHA256(publicKey)
+	capture := &hostKeyCapture{}
+	callback := capture.callback(fingerprint)
+	if err := callback("", nil, publicKey); err != nil {
+		t.Fatalf("expected matching fingerprint to pass, got %v", err)
+	}
+	if capture.actual != fingerprint {
+		t.Fatalf("unexpected captured fingerprint: %q", capture.actual)
+	}
+}
+
+func TestHostKeyCaptureRejectsMismatchedFingerprint(t *testing.T) {
+	publicKey := newTestPublicKey(t)
+	actual := ssh.FingerprintSHA256(publicKey)
+	capture := &hostKeyCapture{}
+	err := capture.callback("SHA256:trusted")("", nil, publicKey)
+	if err == nil {
+		t.Fatal("expected mismatch error")
+	}
+	mismatch, ok := err.(HostKeyMismatchError)
+	if !ok {
+		t.Fatalf("expected HostKeyMismatchError, got %T", err)
+	}
+	if mismatch.Expected != "SHA256:trusted" || mismatch.Actual != actual {
+		t.Fatalf("unexpected mismatch error: %+v", mismatch)
+	}
+	if !strings.Contains(err.Error(), "SSH 主机指纹不匹配") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func newTestPublicKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519 key: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create signer: %v", err)
+	}
+	return signer.PublicKey()
+}
+
+func TestTargetAddressDefaultsToPort22(t *testing.T) {
+	target := Target{Host: "10.0.0.21"}
+	if target.Address() != "10.0.0.21:22" {
+		t.Fatalf("unexpected address: %q", target.Address())
 	}
 }

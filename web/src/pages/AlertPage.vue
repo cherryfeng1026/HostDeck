@@ -1,27 +1,51 @@
 <script setup lang="ts">
 import {
   NButton,
+  NInput,
   NInputNumber,
   NScrollbar,
   NSelect,
   NSwitch,
+  NTabPane,
+  NTabs,
   NTag,
   useMessage,
 } from 'naive-ui'
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { createAlertRule, getAlertRules, getAlerts, updateAlertRule } from '../services/api'
+import {
+  ackAlert,
+  createAlertRule,
+  getAlertHistory,
+  getAlertNotificationSettings,
+  getAlertRules,
+  getAlerts,
+  muteAlert,
+  updateAlertNotificationSettings,
+  updateAlertRule,
+} from '../services/api'
 import { useSession } from '../session'
-import type { AlertEvent, AlertRule } from '../types'
+import type { AlertEvent, AlertHistoryEvent, AlertNotificationSettings, AlertRule } from '../types'
 
 const message = useMessage()
 const router = useRouter()
 const { canManageInfrastructure } = useSession()
 const alerts = ref<AlertEvent[]>([])
+const historyItems = ref<AlertHistoryEvent[]>([])
 const rules = ref<AlertRule[]>([])
 const loading = ref(false)
 const savingRule = ref(false)
+const savingNotificationSettings = ref(false)
 const editingRuleId = ref<number | null>(null)
+const actingAlertId = ref<number | null>(null)
+
+const notificationSettings = reactive<AlertNotificationSettings>({
+  enabled: false,
+  webhookURL: '',
+  webhookConfigured: false,
+  clearWebhookURL: false,
+  webhookTimeoutSeconds: 5,
+})
 
 const ruleForm = reactive({
   metric: 'online',
@@ -46,16 +70,71 @@ const operatorOptions = [
   { label: '小于等于', value: 'lte' },
 ]
 
+const muteDurationOptions = [
+  { label: '15 分钟', value: 15 },
+  { label: '30 分钟', value: 30 },
+  { label: '1 小时', value: 60 },
+  { label: '4 小时', value: 240 },
+]
+
+const muteDurationByAlertId = ref<Record<number, number>>({})
+
 async function loadData() {
   loading.value = true
   try {
-    const [alertList, ruleList] = await Promise.all([getAlerts(), getAlertRules()])
+    const [alertList, alertHistory, ruleList, alertNotificationConfig] = await Promise.all([
+      getAlerts(),
+      getAlertHistory(),
+      getAlertRules(),
+      canManageInfrastructure.value ? getAlertNotificationSettings() : Promise.resolve(null),
+    ])
     alerts.value = alertList
+    historyItems.value = alertHistory
     rules.value = ruleList
+    if (alertNotificationConfig) {
+      notificationSettings.enabled = alertNotificationConfig.enabled
+      notificationSettings.webhookURL = alertNotificationConfig.webhookURL
+      notificationSettings.webhookConfigured = !!alertNotificationConfig.webhookConfigured
+      notificationSettings.clearWebhookURL = false
+      notificationSettings.webhookTimeoutSeconds = alertNotificationConfig.webhookTimeoutSeconds
+    } else {
+      notificationSettings.enabled = false
+      notificationSettings.webhookURL = ''
+      notificationSettings.webhookConfigured = false
+      notificationSettings.clearWebhookURL = false
+      notificationSettings.webhookTimeoutSeconds = 5
+    }
   } catch (error) {
     message.error(error instanceof Error ? error.message : '加载告警数据失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function handleAcknowledge(alert: AlertEvent) {
+  actingAlertId.value = alert.id
+  try {
+    await ackAlert(alert.id)
+    message.success('告警已确认')
+    await loadData()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '确认告警失败')
+  } finally {
+    actingAlertId.value = null
+  }
+}
+
+async function handleMute(alert: AlertEvent) {
+  actingAlertId.value = alert.id
+  const durationMinutes = muteDurationByAlertId.value[alert.id] || 30
+  try {
+    await muteAlert(alert.id, durationMinutes)
+    message.success(`告警已静默 ${formatMuteDuration(durationMinutes)}`)
+    await loadData()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '静默告警失败')
+  } finally {
+    actingAlertId.value = null
   }
 }
 
@@ -76,6 +155,28 @@ async function handleSubmitRule() {
     message.error(error instanceof Error ? error.message : '保存告警规则失败')
   } finally {
     savingRule.value = false
+  }
+}
+
+async function handleSubmitNotificationSettings() {
+  savingNotificationSettings.value = true
+  try {
+    const saved = await updateAlertNotificationSettings({
+      enabled: notificationSettings.enabled,
+      webhookURL: notificationSettings.webhookURL.trim(),
+      clearWebhookURL: notificationSettings.clearWebhookURL,
+      webhookTimeoutSeconds: notificationSettings.webhookTimeoutSeconds,
+    })
+    notificationSettings.enabled = saved.enabled
+    notificationSettings.webhookURL = saved.webhookURL
+    notificationSettings.webhookConfigured = !!saved.webhookConfigured
+    notificationSettings.clearWebhookURL = false
+    notificationSettings.webhookTimeoutSeconds = saved.webhookTimeoutSeconds
+    message.success('通知设置已保存')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '保存通知设置失败')
+  } finally {
+    savingNotificationSettings.value = false
   }
 }
 
@@ -105,8 +206,57 @@ function operatorLabel(operator: string) {
   return operatorOptions.find((item) => item.value === operator)?.label || operator
 }
 
-function formatDateTime(value: string) {
+function formatDateTime(value?: string) {
+  if (!value) return '未知时间'
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
+}
+
+function formatDuration(start?: string, end?: string) {
+  if (!start) return '未知'
+  const startAt = new Date(start).getTime()
+  const endAt = end ? new Date(end).getTime() : Date.now()
+  const diffSeconds = Math.max(0, Math.floor((endAt - startAt) / 1000))
+  const hours = Math.floor(diffSeconds / 3600)
+  const minutes = Math.floor((diffSeconds % 3600) / 60)
+  const seconds = diffSeconds % 60
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`
+  if (minutes > 0) return `${minutes} 分钟 ${seconds} 秒`
+  return `${seconds} 秒`
+}
+
+function formatMuteDuration(durationMinutes: number) {
+  if (durationMinutes % 60 === 0 && durationMinutes >= 60) {
+    return `${durationMinutes / 60} 小时`
+  }
+  return `${durationMinutes} 分钟`
+}
+
+function statusLabel(status: string) {
+  switch (status) {
+    case 'acknowledged':
+      return '已确认'
+    case 'muted':
+      return '已静默'
+    case 'pending':
+      return '等待持续时间'
+    default:
+      return '活动中'
+  }
+}
+
+function historyEventLabel(eventType: string) {
+  switch (eventType) {
+    case 'triggered':
+      return '触发'
+    case 'acknowledged':
+      return '确认'
+    case 'muted':
+      return '静默'
+    case 'resolved':
+      return '恢复'
+    default:
+      return eventType
+  }
 }
 
 onMounted(() => {
@@ -120,7 +270,7 @@ onMounted(() => {
       <div class="page-header">
         <div class="header-text">
           <h1>监控告警</h1>
-          <p>实时监控并追踪所有的警告与错误，管理自定义告警规则。</p>
+          <p>管理阈值规则，跟踪活动告警，并查看告警生命周期历史。</p>
         </div>
         <div class="header-actions">
           <n-button ghost @click="loadData" style="color: #a1a1aa; border-color: rgba(255,255,255,0.1)">
@@ -133,51 +283,119 @@ onMounted(() => {
       </div>
 
       <div class="layout-grid">
-        <!-- 实时告警区域 -->
         <div class="bento-card alerts-panel">
           <div class="card-title-bar">
-            <span class="card-title">当前活动告警 ({{ alerts.length }})</span>
+            <span class="card-title">告警中心</span>
+            <n-tag size="small" :type="alerts.length ? 'warning' : 'success'" bordered>
+              {{ alerts.length ? `${alerts.length} 条活动告警` : '当前平稳' }}
+            </n-tag>
           </div>
-          
-          <div v-if="alerts.length === 0" class="empty-state">
-            当前系统运行平稳，无活动告警。
-          </div>
-          
-          <div v-else class="timeline-container">
-            <div v-for="alert in alerts" :key="`${alert.ruleId}-${alert.serverId}`" class="alert-card">
-              <div class="alert-icon" :class="alert.severity">
-                <span v-if="alert.severity === 'critical'">!</span>
-                <span v-else>i</span>
+
+          <n-tabs type="line" animated>
+            <n-tab-pane name="active" :tab="`活动告警 (${alerts.length})`">
+              <div v-if="!alerts.length" class="empty-state">
+                当前没有正式活动告警。
               </div>
-              <div class="alert-content">
-                <div class="alert-header">
-                  <span class="alert-server" @click="router.push(`/servers/${alert.serverId}`)">{{ alert.serverName }}</span>
-                  <span class="alert-time">{{ formatDateTime(alert.triggeredAt) }}</span>
-                </div>
-                <div class="alert-message">{{ alert.message }}</div>
-                <div class="alert-footer">
-                  <n-tag :type="alert.severity === 'critical' ? 'error' : 'warning'" size="small" bordered>
-                    {{ alert.severity === 'critical' ? '严重' : '警告' }}
-                  </n-tag>
-                  <n-button size="small" ghost type="primary" class="ml-auto" @click="router.push(`/servers/${alert.serverId}`)">
-                    查看服务器
-                  </n-button>
+              <div v-else class="timeline-container">
+                <div v-for="alert in alerts" :key="alert.id" class="alert-card">
+                  <div class="alert-icon" :class="alert.severity">
+                    <span v-if="alert.severity === 'critical'">!</span>
+                    <span v-else>i</span>
+                  </div>
+                  <div class="alert-content">
+                    <div class="alert-header">
+                      <span class="alert-server" @click="router.push(`/servers/${alert.serverId}`)">{{ alert.serverName }}</span>
+                      <span class="alert-time">{{ formatDateTime(alert.lastTriggeredAt) }}</span>
+                    </div>
+                    <div class="alert-message">{{ alert.message }}</div>
+                    <div class="alert-meta">
+                      <n-tag :type="alert.severity === 'critical' ? 'error' : 'warning'" size="small" bordered>
+                        {{ alert.severity === 'critical' ? '严重' : '警告' }}
+                      </n-tag>
+                      <n-tag size="small" bordered type="info">{{ statusLabel(alert.status) }}</n-tag>
+                      <span class="meta-text">持续 {{ formatDuration(alert.triggeredAt, alert.lastTriggeredAt) }}</span>
+                      <span v-if="alert.durationSeconds > 0" class="meta-text">规则窗口 {{ alert.durationSeconds }} 秒</span>
+                      <span v-if="alert.acknowledgedBy" class="meta-text">确认人 {{ alert.acknowledgedBy }}</span>
+                      <span v-if="alert.mutedUntil" class="meta-text">静默至 {{ formatDateTime(alert.mutedUntil) }}</span>
+                    </div>
+                    <div class="alert-footer">
+                      <n-button size="small" ghost type="primary" @click="router.push(`/servers/${alert.serverId}`)">
+                        查看服务器
+                      </n-button>
+                      <div v-if="canManageInfrastructure" class="inline-actions">
+                        <n-button
+                          v-if="alert.status === 'active'"
+                          size="small"
+                          ghost
+                          @click="handleAcknowledge(alert)"
+                          :loading="actingAlertId === alert.id"
+                        >
+                          确认
+                        </n-button>
+                        <template v-if="alert.status !== 'muted'">
+                          <n-select
+                            :value="muteDurationByAlertId[alert.id] || 30"
+                            :options="muteDurationOptions"
+                            size="small"
+                            consistent-menu-width
+                            class="mute-select"
+                            @update:value="(value: number) => (muteDurationByAlertId[alert.id] = value)"
+                          />
+                          <n-button
+                            size="small"
+                            ghost
+                            type="warning"
+                            @click="handleMute(alert)"
+                            :loading="actingAlertId === alert.id"
+                          >
+                            静默
+                          </n-button>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
-          </div>
+            </n-tab-pane>
+
+            <n-tab-pane name="history" :tab="`历史事件 (${historyItems.length})`">
+              <div v-if="!historyItems.length" class="empty-state">
+                暂无告警历史事件。
+              </div>
+              <div v-else class="timeline-container">
+                <div v-for="item in historyItems" :key="item.id" class="alert-card history-card">
+                  <div class="alert-icon history-icon">
+                    <span>{{ historyEventLabel(item.eventType).slice(0, 1) }}</span>
+                  </div>
+                  <div class="alert-content">
+                    <div class="alert-header">
+                      <span class="alert-server" @click="router.push(`/servers/${item.serverId}`)">{{ item.serverName }}</span>
+                      <span class="alert-time">{{ formatDateTime(item.createdAt) }}</span>
+                    </div>
+                    <div class="alert-message">{{ item.message }}</div>
+                    <div class="alert-meta">
+                      <n-tag size="small" bordered>{{ historyEventLabel(item.eventType) }}</n-tag>
+                      <n-tag :type="item.severity === 'critical' ? 'error' : 'warning'" size="small" bordered>
+                        {{ item.severity === 'critical' ? '严重' : '警告' }}
+                      </n-tag>
+                      <span class="meta-text">首次触发 {{ formatDateTime(item.triggeredAt) }}</span>
+                      <span v-if="item.actorUsername" class="meta-text">操作者 {{ item.actorUsername }}</span>
+                      <span v-if="item.detail" class="meta-text">{{ item.detail }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </n-tab-pane>
+          </n-tabs>
         </div>
 
-        <!-- 规则管理区域 -->
         <div class="rules-panel">
-          
-          <!-- 编辑规则表单 -->
           <div v-if="canManageInfrastructure" class="bento-card form-card">
             <div class="card-title-bar">
               <span class="card-title">{{ editingRuleId ? '编辑规则' : '新增规则' }}</span>
               <n-button v-if="editingRuleId" size="small" text style="color: #a1a1aa" @click="resetRuleForm">取消编辑</n-button>
             </div>
-            
+
             <div class="rule-grid">
               <div class="field-block">
                 <span>监控指标</span>
@@ -207,16 +425,68 @@ onMounted(() => {
             </div>
           </div>
 
-          <!-- 已有规则列表 -->
+          <div v-if="canManageInfrastructure" class="bento-card form-card">
+            <div class="card-title-bar">
+              <span class="card-title">通知通道</span>
+              <n-tag size="small" :type="notificationSettings.enabled ? 'success' : 'default'" bordered>
+                {{ notificationSettings.enabled ? '已启用' : '已关闭' }}
+              </n-tag>
+            </div>
+
+            <div class="rule-grid">
+              <div class="field-block field-block--switch">
+                <span>Webhook 通知</span>
+                <n-switch v-model:value="notificationSettings.enabled" :disabled="!canManageInfrastructure" />
+              </div>
+              <div class="field-block" style="grid-column: span 2">
+                <span>Webhook 地址</span>
+                <n-input
+                  v-model:value="notificationSettings.webhookURL"
+                  placeholder="https://hooks.example.com/alerts"
+                  :disabled="!canManageInfrastructure || notificationSettings.clearWebhookURL"
+                />
+                <small v-if="notificationSettings.webhookConfigured && !notificationSettings.webhookURL && !notificationSettings.clearWebhookURL" class="field-hint">
+                  已保存地址，当前为安全起见不回显明文。
+                </small>
+              </div>
+              <div class="field-block field-block--switch">
+                <span>清空已保存地址</span>
+                <n-switch v-model:value="notificationSettings.clearWebhookURL" :disabled="!canManageInfrastructure" />
+              </div>
+              <div class="field-block">
+                <span>超时(秒)</span>
+                <n-input-number
+                  v-model:value="notificationSettings.webhookTimeoutSeconds"
+                  :min="1"
+                  style="width: 100%"
+                  class="dark-input"
+                  :disabled="!canManageInfrastructure"
+                />
+              </div>
+            </div>
+            <p class="notification-hint">静默中的告警和维护窗口内的告警不会发送通知。</p>
+            <div v-if="canManageInfrastructure" class="rule-actions">
+              <n-button
+                type="primary"
+                class="glow-btn"
+                :loading="savingNotificationSettings"
+                @click="handleSubmitNotificationSettings"
+                style="width: 100%"
+              >
+                保存通知设置
+              </n-button>
+            </div>
+          </div>
+
           <div class="bento-card rules-list-card">
             <div class="card-title-bar">
               <span class="card-title">规则列表 ({{ rules.length }})</span>
             </div>
-            
+
             <div v-if="rules.length === 0" class="empty-state">
               暂未配置任何监控规则。
             </div>
-            
+
             <div class="rules-list">
               <div v-for="rule in rules" :key="rule.id" class="rule-item">
                 <div class="rule-info">
@@ -231,7 +501,7 @@ onMounted(() => {
                     {{ rule.enabled ? '运行中' : '已停用' }}
                   </div>
                 </div>
-                <div class="rule-btn">
+                <div class="rule-btn" v-if="canManageInfrastructure">
                   <n-button size="small" ghost @click="startEditRule(rule)">修改</n-button>
                 </div>
               </div>
@@ -283,7 +553,7 @@ onMounted(() => {
 
 .layout-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(400px, 1fr);
+  grid-template-columns: minmax(0, 1.25fr) minmax(420px, 1fr);
   gap: 24px;
 }
 
@@ -311,7 +581,6 @@ onMounted(() => {
   color: #fff;
 }
 
-/* 告警列表区 */
 .alerts-panel {
   display: flex;
   flex-direction: column;
@@ -320,60 +589,63 @@ onMounted(() => {
 .timeline-container {
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  position: relative;
-}
-
-.timeline-container::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 24px;
-  width: 2px;
-  background: rgba(255, 255, 255, 0.05);
-  z-index: 0;
+  gap: 16px;
+  margin-top: 8px;
 }
 
 .alert-card {
   display: flex;
-  gap: 24px;
-  position: relative;
-  z-index: 1;
+  gap: 16px;
 }
 
 .alert-icon {
-  width: 50px;
-  height: 50px;
+  width: 46px;
+  height: 46px;
   border-radius: 50%;
   background: #18181b;
   border: 2px solid #3f3f46;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 20px;
-  font-weight: bold;
+  font-size: 18px;
+  font-weight: 700;
   flex-shrink: 0;
-  box-shadow: 0 0 0 4px #050505;
 }
-.alert-icon.critical { border-color: #f43f5e; color: #f43f5e; box-shadow: 0 0 15px rgba(244, 63, 94, 0.2); }
-.alert-icon.warning { border-color: #f59e0b; color: #f59e0b; box-shadow: 0 0 15px rgba(245, 158, 11, 0.2); }
+
+.alert-icon.critical {
+  border-color: #f43f5e;
+  color: #f43f5e;
+  box-shadow: 0 0 15px rgba(244, 63, 94, 0.2);
+}
+
+.alert-icon.warning {
+  border-color: #f59e0b;
+  color: #f59e0b;
+  box-shadow: 0 0 15px rgba(245, 158, 11, 0.2);
+}
+
+.history-icon {
+  border-color: #3b82f6;
+  color: #3b82f6;
+  box-shadow: 0 0 15px rgba(59, 130, 246, 0.2);
+}
 
 .alert-content {
   flex: 1;
   background: rgba(0, 0, 0, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.05);
   border-radius: 16px;
-  padding: 20px;
-  transition: transform 0.2s;
+  padding: 18px;
 }
-.alert-card:hover .alert-content {
-  border-color: rgba(255, 255, 255, 0.15);
+
+.history-card .alert-content {
+  opacity: 0.92;
 }
 
 .alert-header {
   display: flex;
   justify-content: space-between;
+  gap: 16px;
   margin-bottom: 8px;
 }
 
@@ -383,7 +655,10 @@ onMounted(() => {
   font-size: 15px;
   cursor: pointer;
 }
-.alert-server:hover { color: #10b981; }
+
+.alert-server:hover {
+  color: #10b981;
+}
 
 .alert-time {
   font-size: 13px;
@@ -394,28 +669,45 @@ onMounted(() => {
   color: #d4d4d8;
   font-size: 14px;
   line-height: 1.6;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
+}
+
+.alert-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.meta-text {
+  color: #a1a1aa;
+  font-size: 12px;
 }
 
 .alert-footer {
   display: flex;
+  justify-content: space-between;
+  gap: 12px;
   align-items: center;
   border-top: 1px solid rgba(255, 255, 255, 0.05);
-  padding-top: 16px;
-}
-.ml-auto {
-  margin-left: auto;
+  padding-top: 14px;
 }
 
-/* 规则区域 */
+.inline-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+:deep(.mute-select) {
+  width: 110px;
+}
+
 .rules-panel {
   display: flex;
   flex-direction: column;
   gap: 24px;
-}
-
-.form-card {
-  padding-bottom: 24px;
 }
 
 .rule-grid {
@@ -448,6 +740,13 @@ onMounted(() => {
   margin-top: 24px;
 }
 
+.notification-hint {
+  margin: 16px 0 0;
+  color: #a1a1aa;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .glow-btn {
   box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
   transition: all 0.3s ease;
@@ -455,6 +754,7 @@ onMounted(() => {
   color: #fff !important;
   border: none;
 }
+
 .glow-btn:hover {
   box-shadow: 0 0 30px rgba(16, 185, 129, 0.6);
   transform: translateY(-1px);
@@ -464,12 +764,12 @@ onMounted(() => {
 :deep(.dark-input .n-base-selection__border) {
   border-color: rgba(255, 255, 255, 0.1);
 }
+
 :deep(.dark-input .n-input__placeholder),
 :deep(.dark-input .n-base-selection-placeholder) {
   color: #71717a;
 }
 
-/* 规则列表 */
 .rules-list {
   display: flex;
   flex-direction: column;
@@ -480,14 +780,11 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 16px;
   padding: 16px;
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid rgba(255, 255, 255, 0.05);
   border-radius: 12px;
-  transition: border-color 0.2s;
-}
-.rule-item:hover {
-  border-color: rgba(255, 255, 255, 0.15);
 }
 
 .rule-info {
@@ -540,7 +837,7 @@ onMounted(() => {
 
 .empty-state {
   color: #71717a;
-  padding: 24px 0;
+  padding: 32px 0;
   text-align: center;
 }
 
@@ -555,6 +852,20 @@ onMounted(() => {
     flex-direction: column;
     align-items: flex-start;
     gap: 16px;
+  }
+
+  .alert-header,
+  .alert-footer {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .rule-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field-block--switch {
+    grid-column: span 1;
   }
 }
 </style>
