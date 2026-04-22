@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -100,6 +101,77 @@ func seedCommandServer(t *testing.T, repo *storage.ServerRepository) {
 	}
 }
 
+func newAuthenticatedCommandRouterForTest(t *testing.T) (http.Handler, *sql.DB) {
+	t.Helper()
+	db := openCommandTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seedCommandServer(t, serverRepo)
+	auditRepo := storage.NewAuditEventRepository(db)
+	authService := service.NewAuthService(
+		storage.NewUserRepository(db),
+		storage.NewSessionRepository(db),
+		storage.NewAPITokenRepository(db),
+		storage.NewAuthEventRepository(db),
+		24*time.Hour,
+	)
+	if _, err := authService.CreateInitialAdmin(context.Background(), "admin", "admin123", "", "", "test_setup"); err != nil {
+		t.Fatalf("create initial admin: %v", err)
+	}
+	commandService := service.NewCommandService(
+		service.NewServerConnectionService(
+			serverRepo,
+			storage.NewServerCredentialRepository(db),
+			"test-master-key",
+		),
+		&fakeCommandRunner{},
+		storage.NewCommandLogRepository(db),
+		storage.NewCommandTemplateRepository(db),
+	)
+	if err := commandService.EnsureDefaultTemplates(context.Background()); err != nil {
+		t.Fatalf("ensure default templates: %v", err)
+	}
+	router := httpx.NewRouterWithHandlers(
+		api.NewServerHandler(serverRepo, nil, auditRepo),
+		nil,
+		nil,
+		nil,
+		api.NewCommandHandler(commandService, auditRepo),
+		nil,
+		httpx.WithAuthHandler(api.NewAuthHandler(authService, "hostdeck_session", false, "bootstrap-token")),
+		httpx.WithAPIMiddleware(httpx.NewSessionAuthMiddleware(authService, "hostdeck_session")),
+		httpx.WithActionGuard(httpx.RequireInfrastructureAccess),
+	)
+	return router, db
+}
+
+func loginCommandUser(t *testing.T, router http.Handler, username string, password string) *http.Cookie {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"%s","password":"%s"}`, username, password)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d %s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("expected session cookie")
+	}
+	return cookies[0]
+}
+
+func createCommandUser(t *testing.T, router http.Handler, cookie *http.Cookie, username string, password string, role string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/users", strings.NewReader(fmt.Sprintf(`{"username":"%s","password":"%s","role":"%s"}`, username, password, role)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create user failed: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestExecuteCommand_StoresLog(t *testing.T) {
 	db := openCommandTestDB(t)
 	serverRepo := storage.NewServerRepository(db, "test-master-key")
@@ -112,7 +184,7 @@ func TestExecuteCommand_StoresLog(t *testing.T) {
 	)
 	runner := &fakeCommandRunner{}
 
-	svc := service.NewCommandService(connectionService, runner, logRepo)
+	svc := service.NewCommandService(connectionService, runner, logRepo, storage.NewCommandTemplateRepository(db))
 	result, err := svc.ExecuteWithExecutor(context.Background(), 1, "df -h", 15*time.Second, "operator")
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -152,6 +224,7 @@ func TestCommandRoutes_ExecuteReturnsResult(t *testing.T) {
 		),
 		&fakeCommandRunner{},
 		storage.NewCommandLogRepository(db),
+		storage.NewCommandTemplateRepository(db),
 	)
 
 	router := httpx.NewRouterWithHandlers(
@@ -225,6 +298,7 @@ func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
 		),
 		runner,
 		logRepo,
+		storage.NewCommandTemplateRepository(db),
 	)
 
 	router := httpx.NewRouterWithHandlers(
@@ -328,6 +402,7 @@ func TestCommandRoutes_ExecuteReturnsConflictForDisabledServer(t *testing.T) {
 		),
 		&fakeCommandRunner{},
 		storage.NewCommandLogRepository(db),
+		storage.NewCommandTemplateRepository(db),
 	)
 
 	router := httpx.NewRouterWithHandlers(
@@ -392,6 +467,7 @@ func TestCommandRoutes_ListHistoryReturnsFilteredLogs(t *testing.T) {
 		),
 		&fakeCommandRunner{},
 		logRepo,
+		storage.NewCommandTemplateRepository(db),
 	)
 	router := httpx.NewRouterWithHandlers(
 		api.NewServerHandler(serverRepo, nil),
@@ -433,6 +509,7 @@ func TestCommandRoutes_ListHistoryRejectsInvalidTimeRange(t *testing.T) {
 		),
 		&fakeCommandRunner{},
 		storage.NewCommandLogRepository(db),
+		storage.NewCommandTemplateRepository(db),
 	)
 	router := httpx.NewRouterWithHandlers(
 		api.NewServerHandler(serverRepo, nil),
@@ -471,6 +548,7 @@ func TestCommandRoutes_ListHistoryRejectsNonPositiveNumericFilters(t *testing.T)
 		),
 		&fakeCommandRunner{},
 		storage.NewCommandLogRepository(db),
+		storage.NewCommandTemplateRepository(db),
 	)
 	router := httpx.NewRouterWithHandlers(
 		api.NewServerHandler(serverRepo, nil),
@@ -510,21 +588,11 @@ func TestCommandRoutes_ListHistoryRejectsNonPositiveNumericFilters(t *testing.T)
 }
 
 func TestCommandRoutes_ListTemplatesReturnsSharedTemplates(t *testing.T) {
-	commandService := service.NewCommandService(
-		service.NewServerConnectionService(nil, nil, "test-master-key"),
-		&fakeCommandRunner{},
-		storage.NewCommandLogRepository(openCommandTestDB(t)),
-	)
-	router := httpx.NewRouterWithHandlers(
-		nil,
-		nil,
-		nil,
-		nil,
-		api.NewCommandHandler(commandService),
-		nil,
-	)
+	router, _ := newAuthenticatedCommandRouterForTest(t)
+	cookie := loginCommandUser(t, router, "admin", "admin123")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/commands/templates", nil)
+	req.AddCookie(cookie)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -542,5 +610,175 @@ func TestCommandRoutes_ListTemplatesReturnsSharedTemplates(t *testing.T) {
 	}
 	if payload.Items[0].Scope != domain.CommandTemplateScopeShared {
 		t.Fatalf("expected shared scope, got %+v", payload.Items[0])
+	}
+}
+
+func TestCommandRoutes_CreateTemplateCreatesPersonalTemplate(t *testing.T) {
+	router, _ := newAuthenticatedCommandRouterForTest(t)
+	cookie := loginCommandUser(t, router, "admin", "admin123")
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/commands/templates",
+		bytes.NewBufferString(`{"name":"检查 nginx 状态","description":"巡检 nginx","command":"systemctl status {{service}} --no-pager","scope":"personal","riskLevel":"normal"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var created domain.CommandTemplate
+	if err := json.NewDecoder(rec.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created template: %v", err)
+	}
+	if created.Scope != domain.CommandTemplateScopePersonal || created.CreatedBy != "admin" {
+		t.Fatalf("unexpected created template: %+v", created)
+	}
+	if len(created.Variables) != 1 || created.Variables[0].Name != "service" {
+		t.Fatalf("expected extracted variables, got %+v", created.Variables)
+	}
+	if !created.IsFavorite {
+		t.Fatalf("expected personal template to default favorite, got %+v", created)
+	}
+}
+
+func TestCommandRoutes_CreateTemplateReturnsConflictForDuplicateID(t *testing.T) {
+	router, _ := newAuthenticatedCommandRouterForTest(t)
+	cookie := loginCommandUser(t, router, "admin", "admin123")
+
+	body := `{"name":"检查 nginx 状态","description":"巡检 nginx","command":"systemctl status nginx","scope":"personal","riskLevel":"normal"}`
+	firstReq := httptest.NewRequest(http.MethodPost, "/api/commands/templates", bytes.NewBufferString(body))
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstReq.AddCookie(cookie)
+	firstRec := httptest.NewRecorder()
+	router.ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusCreated {
+		t.Fatalf("expected first create 201, got %d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/api/commands/templates", bytes.NewBufferString(body))
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondReq.AddCookie(cookie)
+	secondRec := httptest.NewRecorder()
+	router.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusConflict {
+		t.Fatalf("expected duplicate create 409, got %d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(secondRec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode duplicate response: %v", err)
+	}
+	if payload["error"] != "命令模板已存在" {
+		t.Fatalf("unexpected duplicate error: %q", payload["error"])
+	}
+}
+
+func TestCommandRoutes_SetTemplateFavoriteUpdatesFavoriteState(t *testing.T) {
+	router, _ := newAuthenticatedCommandRouterForTest(t)
+	cookie := loginCommandUser(t, router, "admin", "admin123")
+
+	createReq := httptest.NewRequest(
+		http.MethodPost,
+		"/api/commands/templates",
+		bytes.NewBufferString(`{"name":"检查 nginx 状态","description":"巡检 nginx","command":"systemctl status nginx","scope":"personal","riskLevel":"normal"}`),
+	)
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.AddCookie(cookie)
+	createRec := httptest.NewRecorder()
+	router.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected create 201, got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	favoriteReq := httptest.NewRequest(
+		http.MethodPost,
+		"/api/commands/templates/personal-admin-nginx/favorite",
+		bytes.NewBufferString(`{"favorite":false}`),
+	)
+	favoriteReq.Header.Set("Content-Type", "application/json")
+	favoriteReq.AddCookie(cookie)
+	favoriteRec := httptest.NewRecorder()
+	router.ServeHTTP(favoriteRec, favoriteReq)
+	if favoriteRec.Code != http.StatusOK {
+		t.Fatalf("expected favorite 200, got %d body=%s", favoriteRec.Code, favoriteRec.Body.String())
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/commands/templates", nil)
+	listReq.AddCookie(cookie)
+	listRec := httptest.NewRecorder()
+	router.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected list 200, got %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	var payload struct {
+		Items []domain.CommandTemplate `json:"items"`
+	}
+	if err := json.NewDecoder(listRec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode template list: %v", err)
+	}
+	for _, item := range payload.Items {
+		if item.ID == "personal-admin-nginx" && item.IsFavorite {
+			t.Fatalf("expected favorite removed, got %+v", item)
+		}
+	}
+}
+
+func TestCommandRoutes_CreateSharedTemplateRejectsViewer(t *testing.T) {
+	router, _ := newAuthenticatedCommandRouterForTest(t)
+	adminCookie := loginCommandUser(t, router, "admin", "admin123")
+	createCommandUser(t, router, adminCookie, "viewer-1", "viewer123", domain.RoleViewer)
+	viewerCookie := loginCommandUser(t, router, "viewer-1", "viewer123")
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/commands/templates",
+		bytes.NewBufferString(`{"name":"共享模板","description":"viewer test","command":"uptime","scope":"shared","riskLevel":"normal"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(viewerCookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCommandRoutes_SetTemplateFavoriteRejectsInvisibleTemplate(t *testing.T) {
+	router, _ := newAuthenticatedCommandRouterForTest(t)
+	adminCookie := loginCommandUser(t, router, "admin", "admin123")
+	createCommandUser(t, router, adminCookie, "operator-1", "operator123", domain.RoleOperator)
+	operatorCookie := loginCommandUser(t, router, "operator-1", "operator123")
+
+	createReq := httptest.NewRequest(
+		http.MethodPost,
+		"/api/commands/templates",
+		bytes.NewBufferString(`{"name":"仅管理员可见模板","description":"private","command":"echo secret","scope":"personal","riskLevel":"normal"}`),
+	)
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.AddCookie(adminCookie)
+	createRec := httptest.NewRecorder()
+	router.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected create 201, got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created domain.CommandTemplate
+	if err := json.NewDecoder(createRec.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created template: %v", err)
+	}
+
+	favoriteReq := httptest.NewRequest(
+		http.MethodPost,
+		fmt.Sprintf("/api/commands/templates/%s/favorite", created.ID),
+		bytes.NewBufferString(`{"favorite":true}`),
+	)
+	favoriteReq.Header.Set("Content-Type", "application/json")
+	favoriteReq.AddCookie(operatorCookie)
+	favoriteRec := httptest.NewRecorder()
+	router.ServeHTTP(favoriteRec, favoriteReq)
+	if favoriteRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", favoriteRec.Code, favoriteRec.Body.String())
 	}
 }

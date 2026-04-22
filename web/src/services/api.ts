@@ -11,7 +11,9 @@ import type {
   CommandHistoryRecord,
   CommandResult,
   CommandTemplate,
+  CommandTemplateFavoriteResponse,
   CommandTemplateListResponse,
+  CreateCommandTemplatePayload,
   LiveServerItem,
   MetricsResponse,
   NotificationListResponse,
@@ -156,6 +158,20 @@ export function executeCommands(serverIds: number[], command: string, timeoutSec
 
 export function getCommandTemplates() {
   return request<CommandTemplateListResponse>('/api/commands/templates')
+}
+
+export function createCommandTemplate(payload: CreateCommandTemplatePayload) {
+  return request<CommandTemplate>('/api/commands/templates', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function setCommandTemplateFavorite(id: string, favorite: boolean) {
+  return request<CommandTemplateFavoriteResponse>(`/api/commands/templates/${encodeURIComponent(id)}/favorite`, {
+    method: 'POST',
+    body: JSON.stringify({ favorite }),
+  })
 }
 
 export function getCommandHistory(query: CommandHistoryQuery = {}) {

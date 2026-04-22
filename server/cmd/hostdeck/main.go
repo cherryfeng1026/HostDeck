@@ -57,6 +57,7 @@ func main() {
 	auditEventRepo := storage.NewAuditEventRepository(db)
 	statusRepo := storage.NewStatusRepository(db)
 	commandLogRepo := storage.NewCommandLogRepository(db)
+	commandTemplateRepo := storage.NewCommandTemplateRepository(db)
 	alertRepo := storage.NewAlertRepository(db, cfg.MasterKey)
 	sshClient := sshx.NewClient()
 	connectionService := service.NewServerConnectionService(serverRepo, credentialRepo, cfg.MasterKey)
@@ -105,7 +106,11 @@ func main() {
 	shellService := service.NewShellService(alertService, commandLogRepo, authEventRepo, auditEventRepo, userRepo)
 	serverViewService := service.NewServerViewService(serverRepo, statusRepo)
 	overviewService := service.NewOverviewService(serverRepo, statusRepo, alertService)
-	commandService := service.NewCommandService(connectionService, sshClient, commandLogRepo)
+	commandService := service.NewCommandService(connectionService, sshClient, commandLogRepo, commandTemplateRepo)
+	if err := commandService.EnsureDefaultTemplates(ctx); err != nil {
+		slog.Error("seed command templates failed", "error", err)
+		os.Exit(1)
+	}
 	probeHandler := api.NewProbeHandler(connectionService, sshClient, statusRepo, alertService)
 	apiRouter := httpx.NewRouterWithHandlers(
 		api.NewServerHandler(serverRepo, serverViewService, auditEventRepo),

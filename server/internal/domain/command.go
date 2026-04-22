@@ -16,7 +16,8 @@ type CommandLog struct {
 }
 
 const (
-	CommandTemplateScopeShared = "shared"
+	CommandTemplateScopeShared   = "shared"
+	CommandTemplateScopePersonal = "personal"
 )
 
 const (
@@ -39,7 +40,22 @@ type CommandTemplate struct {
 	Command     string                    `json:"command"`
 	Scope       string                    `json:"scope"`
 	RiskLevel   string                    `json:"riskLevel"`
+	CreatedBy   string                    `json:"createdBy,omitempty"`
+	IsFavorite  bool                      `json:"isFavorite"`
 	Variables   []CommandTemplateVariable `json:"variables,omitempty"`
+}
+
+type CommandTemplateCreateInput struct {
+	Name        string
+	Description string
+	Command     string
+	Scope       string
+	RiskLevel   string
+	Variables   []CommandTemplateVariable
+}
+
+type CommandTemplateFilter struct {
+	Username string
 }
 
 type CommandHistoryFilter struct {

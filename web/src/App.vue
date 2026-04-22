@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { NConfigProvider, NMessageProvider, darkTheme } from 'naive-ui'
+import { NConfigProvider, NDialogProvider, NMessageProvider, darkTheme } from 'naive-ui'
 import { RouterView } from 'vue-router'
 import AppShell from './layouts/AppShell.vue'
 import { themeOverrides } from './theme'
@@ -7,14 +7,16 @@ import { themeOverrides } from './theme'
 
 <template>
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
-    <n-message-provider>
-      <router-view v-slot="{ Component, route }">
-        <AppShell v-if="!route.meta.public">
-          <component :is="Component" v-if="Component" />
-        </AppShell>
-        <component :is="Component" v-else-if="Component" />
-      </router-view>
-    </n-message-provider>
+    <n-dialog-provider>
+      <n-message-provider>
+        <router-view v-slot="{ Component, route }">
+          <AppShell v-if="!route.meta.public">
+            <component :is="Component" v-if="Component" />
+          </AppShell>
+          <component :is="Component" v-else-if="Component" />
+        </router-view>
+      </n-message-provider>
+    </n-dialog-provider>
   </n-config-provider>
 </template>
 

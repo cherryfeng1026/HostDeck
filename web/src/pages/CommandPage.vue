@@ -6,6 +6,9 @@ import {
   NEmpty,
   NInput,
   NInputNumber,
+  NModal,
+  NRadio,
+  NRadioGroup,
   NScrollbar,
   NSelect,
   NSpin,
@@ -14,7 +17,15 @@ import {
 } from 'naive-ui'
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { executeCommand, executeCommands, getCommandHistory, getCommandTemplates, getServers } from '../services/api'
+import {
+  createCommandTemplate,
+  executeCommand,
+  executeCommands,
+  getCommandHistory,
+  getCommandTemplates,
+  getServers,
+  setCommandTemplateFavorite,
+} from '../services/api'
 import { useSession } from '../session'
 import type { DataTableColumns } from 'naive-ui'
 import type { BatchCommandResult, CommandHistoryRecord, CommandTemplate, ServerAsset } from '../types'
@@ -24,6 +35,8 @@ const message = useMessage()
 const { canManageInfrastructure, currentUser } = useSession()
 const loadingTargets = ref(false)
 const loadingTemplates = ref(false)
+const creatingTemplate = ref(false)
+const togglingFavorite = ref(false)
 const executing = ref(false)
 const loadingHistory = ref(false)
 const servers = ref<ServerAsset[]>([])
@@ -39,7 +52,15 @@ const historyServerId = ref<number | null>(null)
 const historyExecutor = ref('')
 const historyTimeRange = ref<[number, number] | null>(null)
 const selectedHistory = ref<CommandHistoryRecord | null>(null)
+const showCreateTemplateModal = ref(false)
 const templateValues = reactive<Record<string, string>>({})
+const templateForm = reactive({
+  name: '',
+  description: '',
+  command: '',
+  scope: 'personal',
+  riskLevel: 'normal',
+})
 
 function isEnabledServer(serverId: number) {
   return servers.value.some((server) => server.id === serverId && server.enabled)
@@ -59,15 +80,26 @@ const historyServerOptions = computed(() => [
 ])
 
 const templateOptions = computed(() =>
-  templates.value.map((template) => ({
-    label: `${template.name}${template.riskLevel === 'dangerous' ? ' · 高风险' : ''}`,
-    value: template.id,
-  })),
+  templates.value.map((template) => {
+    const badges = [template.scope === 'personal' ? '个人' : '共享']
+    if (template.isFavorite) {
+      badges.unshift('收藏')
+    }
+    if (template.riskLevel === 'dangerous') {
+      badges.push('高风险')
+    }
+    return {
+      label: `${template.name} · ${badges.join(' · ')}`,
+      value: template.id,
+    }
+  }),
 )
 
 const selectedTemplate = computed(() =>
   templates.value.find((template) => template.id === selectedTemplateId.value) ?? null,
 )
+
+const canCreateSharedTemplate = computed(() => canManageInfrastructure.value)
 
 const resolvedCommand = computed(() => {
   if (!selectedTemplate.value) {
@@ -192,6 +224,79 @@ function templateRiskLabel(template: CommandTemplate | null) {
   return template.riskLevel === 'dangerous' ? '高风险模板' : '巡检模板'
 }
 
+function templateScopeLabel(template: CommandTemplate | null) {
+  if (!template) {
+    return ''
+  }
+  return template.scope === 'personal' ? '个人模板' : '共享模板'
+}
+
+function resetTemplateForm() {
+  templateForm.name = ''
+  templateForm.description = ''
+  templateForm.command = selectedTemplate.value?.command || command.value
+  templateForm.scope = canCreateSharedTemplate.value ? 'personal' : 'personal'
+  templateForm.riskLevel = selectedTemplate.value?.riskLevel || 'normal'
+}
+
+function openCreateTemplateModal() {
+  if (!canManageInfrastructure.value) {
+    message.warning('当前账号没有保存命令模板的权限')
+    return
+  }
+  resetTemplateForm()
+  showCreateTemplateModal.value = true
+}
+
+async function submitTemplate() {
+  if (!templateForm.name.trim()) {
+    message.warning('请输入模板名称')
+    return
+  }
+  if (!templateForm.command.trim()) {
+    message.warning('请输入模板命令')
+    return
+  }
+  if (templateForm.scope === 'shared' && !canCreateSharedTemplate.value) {
+    message.warning('当前账号没有创建共享模板的权限')
+    return
+  }
+  creatingTemplate.value = true
+  try {
+    const created = await createCommandTemplate({
+      name: templateForm.name.trim(),
+      description: templateForm.description.trim(),
+      command: templateForm.command.trim(),
+      scope: templateForm.scope,
+      riskLevel: templateForm.riskLevel,
+    })
+    await loadTemplates(created.id)
+    showCreateTemplateModal.value = false
+    message.success(templateForm.scope === 'shared' ? '共享模板已创建' : '个人模板已创建')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '创建命令模板失败')
+  } finally {
+    creatingTemplate.value = false
+  }
+}
+
+async function toggleTemplateFavorite() {
+  if (!selectedTemplate.value) {
+    return
+  }
+  togglingFavorite.value = true
+  const nextFavorite = !selectedTemplate.value.isFavorite
+  try {
+    await setCommandTemplateFavorite(selectedTemplate.value.id, nextFavorite)
+    await loadTemplates(selectedTemplate.value.id)
+    message.success(nextFavorite ? '已加入收藏' : '已取消收藏')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '更新模板收藏失败')
+  } finally {
+    togglingFavorite.value = false
+  }
+}
+
 function missingTemplateVariables() {
   if (!selectedTemplate.value) {
     return []
@@ -247,11 +352,17 @@ async function loadServers() {
   }
 }
 
-async function loadTemplates() {
+async function loadTemplates(preferredTemplateId?: string | null) {
   loadingTemplates.value = true
   try {
     const response = await getCommandTemplates()
     templates.value = response.items
+    const nextTemplateId = preferredTemplateId ?? selectedTemplateId.value
+    if (nextTemplateId && templates.value.some((template) => template.id === nextTemplateId)) {
+      selectedTemplateId.value = nextTemplateId
+    } else if (selectedTemplateId.value && !templates.value.some((template) => template.id === selectedTemplateId.value)) {
+      selectedTemplateId.value = null
+    }
   } catch (error) {
     message.error(error instanceof Error ? error.message : '加载命令模板失败')
   } finally {
@@ -260,6 +371,11 @@ async function loadTemplates() {
 }
 
 async function loadHistory() {
+  if (!canManageInfrastructure.value) {
+    historyItems.value = []
+    loadingHistory.value = false
+    return
+  }
   loadingHistory.value = true
   try {
     historyItems.value = await getCommandHistory({
@@ -394,7 +510,22 @@ onMounted(async () => {
           </div>
 
           <div class="form-group">
-            <label>命令模板</label>
+            <div class="section-title">
+              <label>命令模板</label>
+              <div class="template-toolbar">
+                <n-button ghost size="small" :disabled="!canManageInfrastructure" @click="openCreateTemplateModal">保存为模板</n-button>
+                <n-button
+                  v-if="selectedTemplate"
+                  ghost
+                  size="small"
+                  :disabled="!canManageInfrastructure"
+                  :loading="togglingFavorite"
+                  @click="toggleTemplateFavorite"
+                >
+                  {{ selectedTemplate.isFavorite ? '取消收藏' : '加入收藏' }}
+                </n-button>
+              </div>
+            </div>
             <n-select
               v-model:value="selectedTemplateId"
               clearable
@@ -407,11 +538,15 @@ onMounted(async () => {
             <div v-if="selectedTemplate" class="template-meta">
               <div class="template-meta__head">
                 <strong>{{ selectedTemplate.name }}</strong>
-                <n-tag :type="selectedTemplate.riskLevel === 'dangerous' ? 'warning' : 'success'" size="small" :bordered="false">
-                  {{ templateRiskLabel(selectedTemplate) }}
-                </n-tag>
+                <div class="template-badges">
+                  <n-tag v-if="selectedTemplate.isFavorite" type="warning" size="small" :bordered="false">收藏</n-tag>
+                  <n-tag size="small" :bordered="false">{{ templateScopeLabel(selectedTemplate) }}</n-tag>
+                  <n-tag :type="selectedTemplate.riskLevel === 'dangerous' ? 'warning' : 'success'" size="small" :bordered="false">
+                    {{ templateRiskLabel(selectedTemplate) }}
+                  </n-tag>
+                </div>
               </div>
-              <p>{{ selectedTemplate.description }}</p>
+              <p>{{ selectedTemplate.description || '暂无模板描述' }}</p>
             </div>
           </div>
 
@@ -559,6 +694,51 @@ onMounted(async () => {
         </div>
       </div>
     </div>
+
+    <n-modal v-model:show="showCreateTemplateModal" preset="card" title="保存命令模板" style="max-width: 640px">
+      <div class="template-modal">
+        <div class="form-group">
+          <label>模板名称</label>
+          <n-input v-model:value="templateForm.name" placeholder="例如：检查 nginx 状态" class="dark-input" />
+        </div>
+        <div class="form-group">
+          <label>模板描述</label>
+          <n-input v-model:value="templateForm.description" placeholder="简要说明用途和执行场景" class="dark-input" />
+        </div>
+        <div class="form-group">
+          <label>模板范围</label>
+          <n-radio-group v-model:value="templateForm.scope">
+            <div class="scope-options">
+              <n-radio value="personal">个人模板</n-radio>
+              <n-radio value="shared" :disabled="!canCreateSharedTemplate">共享模板</n-radio>
+            </div>
+          </n-radio-group>
+        </div>
+        <div class="form-group">
+          <label>风险级别</label>
+          <n-radio-group v-model:value="templateForm.riskLevel">
+            <div class="scope-options">
+              <n-radio value="normal">普通</n-radio>
+              <n-radio value="dangerous">高风险</n-radio>
+            </div>
+          </n-radio-group>
+        </div>
+        <div class="form-group">
+          <label>模板命令</label>
+          <n-input
+            v-model:value="templateForm.command"
+            type="textarea"
+            :autosize="{ minRows: 5, maxRows: 10 }"
+            placeholder="支持使用 {{service}} 这类变量占位符"
+            class="code-input dark-input"
+          />
+        </div>
+        <div class="modal-actions">
+          <n-button ghost @click="showCreateTemplateModal = false">取消</n-button>
+          <n-button type="primary" :loading="creatingTemplate" @click="submitTemplate">保存模板</n-button>
+        </div>
+      </div>
+    </n-modal>
   </n-scrollbar>
 </template>
 
@@ -615,6 +795,24 @@ onMounted(async () => {
   margin-bottom: 8px;
 }
 
+.section-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.section-title label {
+  margin-bottom: 0;
+}
+
+.template-toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .template-meta {
   margin-top: 10px;
   padding: 12px;
@@ -628,6 +826,13 @@ onMounted(async () => {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+}
+
+.template-badges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .template-meta strong {
@@ -743,6 +948,25 @@ onMounted(async () => {
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(180px, 1fr) minmax(160px, 1fr) minmax(260px, 1.2fr) auto;
   gap: 12px;
+}
+
+.template-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.scope-options {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 8px;
 }
 
 .result-card,

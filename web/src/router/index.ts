@@ -25,7 +25,7 @@ const routes: RouteRecordRaw[] = [
   {
     path: '/commands',
     component: () => import('../pages/CommandPage.vue'),
-    meta: { title: '命令执行' },
+    meta: { title: '命令执行', infrastructureOnly: true },
   },
   {
     path: '/users',
@@ -49,7 +49,7 @@ export const router = createRouter({
 })
 
 router.beforeEach(async (to) => {
-  const { isAuthenticated } = useSession()
+  const { isAuthenticated, currentUser } = useSession()
 
   try {
     await ensureSessionLoaded()
@@ -75,6 +75,10 @@ router.beforeEach(async (to) => {
       path: '/login',
       query: to.fullPath === '/' ? undefined : { redirect: to.fullPath },
     }
+  }
+
+  if (to.meta.infrastructureOnly && currentUser.value?.role === 'viewer') {
+    return '/'
   }
 
   return true

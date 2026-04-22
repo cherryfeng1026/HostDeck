@@ -168,7 +168,25 @@ export interface CommandTemplate {
   command: string
   scope: string
   riskLevel: string
+  createdBy?: string
+  isFavorite: boolean
   variables: CommandTemplateVariable[]
+}
+
+export interface CreateCommandTemplatePayload {
+  name: string
+  description: string
+  command: string
+  scope: string
+  riskLevel: string
+}
+
+export interface SetCommandTemplateFavoritePayload {
+  favorite: boolean
+}
+
+export interface CommandTemplateFavoriteResponse {
+  favorite: boolean
 }
 
 export interface CommandTemplateListResponse {

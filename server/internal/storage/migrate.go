@@ -227,6 +227,38 @@ CREATE TABLE IF NOT EXISTS alert_notification_settings (
 );
 `
 
+const createCommandTemplatesTableSQL = `
+CREATE TABLE IF NOT EXISTS command_templates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    command_text TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    risk_level TEXT NOT NULL DEFAULT 'normal',
+    created_by TEXT NOT NULL DEFAULT '',
+    variables_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+`
+
+const createCommandTemplateFavoritesTableSQL = `
+CREATE TABLE IF NOT EXISTS command_template_favorites (
+    template_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (template_id, username)
+);
+`
+
+const createCommandTemplatesScopeIndexSQL = `
+CREATE INDEX IF NOT EXISTS idx_command_templates_scope_created_by ON command_templates (scope, created_by, updated_at DESC);
+`
+
+const createCommandTemplateFavoritesUsernameIndexSQL = `
+CREATE INDEX IF NOT EXISTS idx_command_template_favorites_username ON command_template_favorites (username, created_at DESC);
+`
+
 const normalizeAlertNotificationSettingsSingletonSQL = `
 DELETE FROM alert_notification_settings
  WHERE id NOT IN (
@@ -390,6 +422,15 @@ var schemaMigrations = []migrationStep{
 		version: 12,
 		statements: []string{
 			normalizeAlertNotificationSettingsSingletonSQL,
+		},
+	},
+	{
+		version: 13,
+		statements: []string{
+			createCommandTemplatesTableSQL,
+			createCommandTemplateFavoritesTableSQL,
+			createCommandTemplatesScopeIndexSQL,
+			createCommandTemplateFavoritesUsernameIndexSQL,
 		},
 	},
 }

@@ -39,7 +39,7 @@ func (s stubSessionAuthenticator) AuthenticateAPIToken(ctx context.Context, toke
 func TestRouterAuth_ReadRoutesAllowViewer(t *testing.T) {
 	serverHandler := api.NewServerHandler(viewerServerStore{}, viewerLiveServerLister{})
 	alertHandler := api.NewAlertHandler(service.NewAlertService(viewerAlertRuleStore{}, viewerAlertStateStore{}, viewerAlertServerStore{}, nil))
-	commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}))
+	commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}, viewerCommandTemplateStore{}))
 	router := httpx.NewRouterWithHandlers(
 		serverHandler,
 		nil,
@@ -52,7 +52,7 @@ func TestRouterAuth_ReadRoutesAllowViewer(t *testing.T) {
 		httpx.WithActionGuard(httpx.RequireInfrastructureAccess),
 	)
 
-	for _, path := range []string{"/api/servers", "/api/alert-rules"} {
+	for _, path := range []string{"/api/servers", "/api/alert-rules", "/api/commands/templates"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.AddCookie(&http.Cookie{Name: "hostdeck_session", Value: "token"})
 		rec := httptest.NewRecorder()
@@ -66,7 +66,7 @@ func TestRouterAuth_ReadRoutesAllowViewer(t *testing.T) {
 func TestRouterAuth_WriteRoutesBlockViewer(t *testing.T) {
 	serverHandler := api.NewServerHandler(viewerServerStore{}, viewerLiveServerLister{})
 	alertHandler := api.NewAlertHandler(service.NewAlertService(viewerAlertRuleStore{}, viewerAlertStateStore{}, viewerAlertServerStore{}, nil))
-	commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}))
+	commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}, viewerCommandTemplateStore{}))
 	router := httpx.NewRouterWithHandlers(
 		serverHandler,
 		nil,
@@ -86,6 +86,8 @@ func TestRouterAuth_WriteRoutesBlockViewer(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: "/api/commands/history"},
 		{method: http.MethodGet, path: "/api/alert-notification-settings"},
+		{method: http.MethodPost, path: "/api/commands/templates", body: `{"name":"巡检 nginx","command":"systemctl status nginx","scope":"personal","riskLevel":"normal"}`},
+		{method: http.MethodPost, path: "/api/commands/templates/shared-disk-usage/favorite", body: `{"favorite":true}`},
 		{method: http.MethodPost, path: "/api/servers", body: `{"name":"prod-web-01","hostname":"prod-web-01","ip":"10.0.0.21","username":"root","authType":"password","password":"super-secret"}`},
 		{method: http.MethodPost, path: "/api/alert-rules", body: `{"metric":"memory_usage","operator":"gte","threshold":70,"durationSeconds":60,"enabled":true}`},
 	}
@@ -215,6 +217,31 @@ func (viewerCommandRunner) Run(ctx context.Context, target sshx.Target, command 
 type viewerCommandLogStore struct{}
 
 func (viewerCommandLogStore) Create(ctx context.Context, log domain.CommandLog) error {
+	return nil
+}
+
+type viewerCommandTemplateStore struct{}
+
+func (viewerCommandTemplateStore) EnsureDefaults(ctx context.Context, items []domain.CommandTemplate) error {
+	return nil
+}
+
+func (viewerCommandTemplateStore) List(ctx context.Context, filter domain.CommandTemplateFilter) ([]domain.CommandTemplate, error) {
+	return []domain.CommandTemplate{{
+		ID:         "shared-disk-usage",
+		Name:       "磁盘使用率",
+		Command:    "df -h",
+		Scope:      domain.CommandTemplateScopeShared,
+		RiskLevel:  domain.CommandTemplateRiskNormal,
+		IsFavorite: false,
+	}}, nil
+}
+
+func (viewerCommandTemplateStore) Create(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error) {
+	return domain.CommandTemplate{}, nil
+}
+
+func (viewerCommandTemplateStore) SetFavorite(ctx context.Context, templateID string, username string, favorite bool) error {
 	return nil
 }
 

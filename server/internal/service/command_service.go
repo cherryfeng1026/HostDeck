@@ -23,6 +23,13 @@ type CommandLogStore interface {
 	ListHistory(ctx context.Context, filter domain.CommandHistoryFilter) ([]domain.CommandLog, error)
 }
 
+type CommandTemplateStore interface {
+	EnsureDefaults(ctx context.Context, items []domain.CommandTemplate) error
+	List(ctx context.Context, filter domain.CommandTemplateFilter) ([]domain.CommandTemplate, error)
+	Create(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error)
+	SetFavorite(ctx context.Context, templateID string, username string, favorite bool) error
+}
+
 type CommandResult struct {
 	Command    string    `json:"command"`
 	Stdout     string    `json:"stdout"`
@@ -44,15 +51,15 @@ type CommandService struct {
 	servers   CommandServerResolver
 	runner    sshx.Runner
 	logs      CommandLogStore
-	templates []domain.CommandTemplate
+	templates CommandTemplateStore
 }
 
-func NewCommandService(servers CommandServerResolver, runner sshx.Runner, logs CommandLogStore) *CommandService {
+func NewCommandService(servers CommandServerResolver, runner sshx.Runner, logs CommandLogStore, templates CommandTemplateStore) *CommandService {
 	return &CommandService{
 		servers:   servers,
 		runner:    runner,
 		logs:      logs,
-		templates: defaultCommandTemplates(),
+		templates: templates,
 	}
 }
 
@@ -179,11 +186,40 @@ func (s *CommandService) executeOnServer(ctx context.Context, server domain.Serv
 	return result, nil
 }
 
-func (s *CommandService) ListTemplates(ctx context.Context) ([]domain.CommandTemplate, error) {
-	_ = ctx
-	items := make([]domain.CommandTemplate, len(s.templates))
-	copy(items, s.templates)
-	return items, nil
+func (s *CommandService) EnsureDefaultTemplates(ctx context.Context) error {
+	if s.templates == nil {
+		return nil
+	}
+	return s.templates.EnsureDefaults(ctx, defaultCommandTemplates())
+}
+
+func (s *CommandService) ListTemplates(ctx context.Context, username string) ([]domain.CommandTemplate, error) {
+	if s.templates == nil {
+		items := make([]domain.CommandTemplate, len(defaultCommandTemplates()))
+		copy(items, defaultCommandTemplates())
+		return items, nil
+	}
+	return s.templates.List(ctx, domain.CommandTemplateFilter{Username: strings.TrimSpace(username)})
+}
+
+func (s *CommandService) CreateTemplate(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error) {
+	if s.templates == nil {
+		return domain.CommandTemplate{}, errors.New("命令模板存储未配置")
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	input.Description = strings.TrimSpace(input.Description)
+	input.Command = strings.TrimSpace(input.Command)
+	if len(input.Variables) == 0 {
+		input.Variables = extractCommandTemplateVariables(input.Command)
+	}
+	return s.templates.Create(ctx, input, strings.TrimSpace(username))
+}
+
+func (s *CommandService) SetTemplateFavorite(ctx context.Context, templateID string, username string, favorite bool) error {
+	if s.templates == nil {
+		return errors.New("命令模板存储未配置")
+	}
+	return s.templates.SetFavorite(ctx, templateID, strings.TrimSpace(username), favorite)
 }
 
 func normalizeServerIDs(serverIDs []int64) []int64 {
@@ -223,6 +259,36 @@ func sanitizeCommandOutput(value string) string {
 	}
 	remaining := len(trimmed) - maxCommandOutputLength
 	return fmt.Sprintf("%s\n...[输出已截断，省略 %d 字符]", trimmed[:maxCommandOutputLength], remaining)
+}
+
+var commandTemplateVariablePattern = regexp.MustCompile(`\{\{\s*([a-zA-Z0-9_-]+)\s*\}\}`)
+
+func extractCommandTemplateVariables(command string) []domain.CommandTemplateVariable {
+	matches := commandTemplateVariablePattern.FindAllStringSubmatch(command, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(matches))
+	variables := make([]domain.CommandTemplateVariable, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(match[1])
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		variables = append(variables, domain.CommandTemplateVariable{
+			Name:     name,
+			Label:    name,
+			Required: true,
+		})
+	}
+	return variables
 }
 
 func defaultCommandTemplates() []domain.CommandTemplate {

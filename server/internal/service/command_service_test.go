@@ -54,14 +54,60 @@ func (s *commandTestLogStore) ListHistory(ctx context.Context, filter domain.Com
 	return nil, nil
 }
 
+type commandTestTemplateStore struct {
+	items   []domain.CommandTemplate
+	ensured []domain.CommandTemplate
+}
+
+func (s *commandTestTemplateStore) EnsureDefaults(ctx context.Context, items []domain.CommandTemplate) error {
+	s.ensured = append([]domain.CommandTemplate(nil), items...)
+	s.items = append([]domain.CommandTemplate(nil), items...)
+	return nil
+}
+
+func (s *commandTestTemplateStore) List(ctx context.Context, filter domain.CommandTemplateFilter) ([]domain.CommandTemplate, error) {
+	if len(s.items) == 0 {
+		s.items = defaultCommandTemplatesForTest()
+	}
+	items := make([]domain.CommandTemplate, len(s.items))
+	copy(items, s.items)
+	return items, nil
+}
+
+func (s *commandTestTemplateStore) Create(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error) {
+	item := domain.CommandTemplate{
+		ID:          "personal-test-template",
+		Name:        input.Name,
+		Description: input.Description,
+		Command:     input.Command,
+		Scope:       input.Scope,
+		RiskLevel:   input.RiskLevel,
+		CreatedBy:   username,
+		IsFavorite:  input.Scope == domain.CommandTemplateScopePersonal,
+		Variables:   input.Variables,
+	}
+	s.items = append(s.items, item)
+	return item, nil
+}
+
+func (s *commandTestTemplateStore) SetFavorite(ctx context.Context, templateID string, username string, favorite bool) error {
+	for index := range s.items {
+		if s.items[index].ID == templateID {
+			s.items[index].IsFavorite = favorite
+		}
+	}
+	return nil
+}
+
 func TestCommandService_ListTemplatesReturnsSharedTemplates(t *testing.T) {
 	svc := service.NewCommandService(
 		commandTestResolver{},
 		commandTestRunner{},
 		&commandTestLogStore{},
+		&commandTestTemplateStore{},
 	)
 
-	items, err := svc.ListTemplates(context.Background())
+	items, err := svc.ListTemplates(context.Background(), "operator")
 	if err != nil {
 		t.Fatalf("list templates: %v", err)
 	}
@@ -90,6 +136,69 @@ func TestCommandService_ListTemplatesReturnsSharedTemplates(t *testing.T) {
 	}
 }
 
+func TestCommandService_EnsureDefaultTemplatesSeedsStore(t *testing.T) {
+	store := &commandTestTemplateStore{}
+	svc := service.NewCommandService(
+		commandTestResolver{},
+		commandTestRunner{},
+		&commandTestLogStore{},
+		store,
+	)
+
+	if err := svc.EnsureDefaultTemplates(context.Background()); err != nil {
+		t.Fatalf("ensure default templates: %v", err)
+	}
+	if len(store.ensured) == 0 {
+		t.Fatal("expected default templates to be seeded")
+	}
+}
+
+func TestCommandService_CreateTemplateExtractsVariables(t *testing.T) {
+	store := &commandTestTemplateStore{}
+	svc := service.NewCommandService(
+		commandTestResolver{},
+		commandTestRunner{},
+		&commandTestLogStore{},
+		store,
+	)
+
+	item, err := svc.CreateTemplate(context.Background(), domain.CommandTemplateCreateInput{
+		Name:      "检查服务状态",
+		Command:   "systemctl status {{service}} --no-pager",
+		Scope:     domain.CommandTemplateScopePersonal,
+		RiskLevel: domain.CommandTemplateRiskNormal,
+	}, "operator")
+	if err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	if item.CreatedBy != "operator" {
+		t.Fatalf("expected created by operator, got %+v", item)
+	}
+	if len(item.Variables) != 1 || item.Variables[0].Name != "service" {
+		t.Fatalf("expected extracted service variable, got %+v", item.Variables)
+	}
+	if len(store.items) != 1 || !store.items[0].IsFavorite {
+		t.Fatalf("expected personal template stored as favorite, got %+v", store.items)
+	}
+}
+
+func TestCommandService_SetTemplateFavoriteUpdatesStore(t *testing.T) {
+	store := &commandTestTemplateStore{items: defaultCommandTemplatesForTest()}
+	svc := service.NewCommandService(
+		commandTestResolver{},
+		commandTestRunner{},
+		&commandTestLogStore{},
+		store,
+	)
+
+	if err := svc.SetTemplateFavorite(context.Background(), "system-disk-usage", "operator", true); err != nil {
+		t.Fatalf("set template favorite: %v", err)
+	}
+	if !store.items[0].IsFavorite {
+		t.Fatalf("expected template to be favorite, got %+v", store.items[0])
+	}
+}
+
 func TestCommandService_ExecuteRedactsSensitiveOutputAndTruncates(t *testing.T) {
 	logs := &commandTestLogStore{}
 	svc := service.NewCommandService(
@@ -99,6 +208,7 @@ func TestCommandService_ExecuteRedactsSensitiveOutputAndTruncates(t *testing.T) 
 			stderr: "api_key=my-key\n",
 		},
 		logs,
+		&commandTestTemplateStore{},
 	)
 
 	result, err := svc.ExecuteWithExecutor(context.Background(), 1, "printenv", 5*time.Second, "operator")
@@ -145,6 +255,30 @@ func containsRedactionMarker(value string) bool {
 
 func containsTruncationMarker(value string) bool {
 	return contains(value, "输出已截断")
+}
+
+func defaultCommandTemplatesForTest() []domain.CommandTemplate {
+	return []domain.CommandTemplate{
+		{
+			ID:        "system-disk-usage",
+			Name:      "磁盘使用率",
+			Command:   "df -h",
+			Scope:     domain.CommandTemplateScopeShared,
+			RiskLevel: domain.CommandTemplateRiskNormal,
+		},
+		{
+			ID:        "service-restart",
+			Name:      "重启服务",
+			Command:   "sudo systemctl restart {{service}}",
+			Scope:     domain.CommandTemplateScopeShared,
+			RiskLevel: domain.CommandTemplateRiskDangerous,
+			Variables: []domain.CommandTemplateVariable{{
+				Name:     "service",
+				Label:    "服务名",
+				Required: true,
+			}},
+		},
+	}
 }
 
 func contains(value string, target string) bool {

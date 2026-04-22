@@ -69,7 +69,7 @@ func NewRouterWithHandlers(
 		api.RegisterServerDetailRoutes(target, detailHandler)
 		api.RegisterServerReadRoutes(target, serverHandler)
 		api.RegisterAlertReadRoutes(target, alertHandler)
-		api.RegisterCommandTemplateRoutes(target, commandHandler)
+		api.RegisterCommandTemplateReadRoutes(target, commandHandler)
 		api.RegisterShellRoutes(target, options.shellHandler)
 		if options.authHandler != nil {
 			target.With(RequireSessionAuth).Get("/api/auth/me", options.authHandler.CurrentUser)

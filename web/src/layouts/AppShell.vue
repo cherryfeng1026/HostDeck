@@ -25,38 +25,45 @@ const commandsIcon = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24
 const usersIcon = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>'
 const alertsIcon = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>'
 
-const navItems = [
-  {
-    label: '总览仪表盘',
-    icon: dashboardIcon,
-    to: '/',
-    match: (path: string) => path === '/',
-  },
-  {
-    label: '服务器管理',
-    icon: serversIcon,
-    to: '/servers',
-    match: (path: string) => path.startsWith('/servers'),
-  },
-  {
-    label: '远程终端',
-    icon: commandsIcon,
-    to: '/commands',
-    match: (path: string) => path.startsWith('/commands'),
-  },
-  {
-    label: '监控告警',
-    icon: alertsIcon,
-    to: '/alerts',
-    match: (path: string) => path.startsWith('/alerts'),
-  },
-  {
-    label: '用户管理',
-    icon: usersIcon,
-    to: '/users',
-    match: (path: string) => path.startsWith('/users'),
-  },
-]
+const navItems = computed(() => {
+  const items = [
+    {
+      label: '总览仪表盘',
+      icon: dashboardIcon,
+      to: '/',
+      match: (path: string) => path === '/',
+    },
+    {
+      label: '服务器管理',
+      icon: serversIcon,
+      to: '/servers',
+      match: (path: string) => path.startsWith('/servers'),
+    },
+  ]
+  if (currentUser.value && currentUser.value.role !== 'viewer') {
+    items.push({
+      label: '远程终端',
+      icon: commandsIcon,
+      to: '/commands',
+      match: (path: string) => path.startsWith('/commands'),
+    })
+  }
+  items.push(
+    {
+      label: '监控告警',
+      icon: alertsIcon,
+      to: '/alerts',
+      match: (path: string) => path.startsWith('/alerts'),
+    },
+    {
+      label: '用户管理',
+      icon: usersIcon,
+      to: '/users',
+      match: (path: string) => path.startsWith('/users'),
+    },
+  )
+  return items
+})
 
 const currentTitle = computed(() => {
   if (typeof route.meta.title === 'string' && route.meta.title.trim()) {

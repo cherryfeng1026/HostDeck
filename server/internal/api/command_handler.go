@@ -12,6 +12,7 @@ import (
 	"hostdeck/server/internal/authctx"
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/service"
+	"hostdeck/server/internal/storage"
 )
 
 type CommandHandler struct {
@@ -20,12 +21,51 @@ type CommandHandler struct {
 }
 
 func (h *CommandHandler) ListTemplates(w http.ResponseWriter, r *http.Request) {
-	items, err := h.service.ListTemplates(r.Context())
+	user, _ := authctx.CurrentUser(r.Context())
+	items, err := h.service.ListTemplates(r.Context(), user.Username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("查询命令模板失败"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+type commandTemplateVariablePayload struct {
+	Name         string `json:"name"`
+	Label        string `json:"label"`
+	Placeholder  string `json:"placeholder"`
+	DefaultValue string `json:"defaultValue"`
+	Required     bool   `json:"required"`
+}
+
+type commandTemplateCreatePayload struct {
+	Name        string                               `json:"name"`
+	Description string                               `json:"description"`
+	Command     string                               `json:"command"`
+	Scope       string                               `json:"scope"`
+	RiskLevel   string                               `json:"riskLevel"`
+	Variables   []commandTemplateVariablePayload     `json:"variables"`
+}
+
+type commandTemplateFavoritePayload struct {
+	Favorite bool `json:"favorite"`
+}
+
+func toCommandTemplateVariables(items []commandTemplateVariablePayload) []domain.CommandTemplateVariable {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]domain.CommandTemplateVariable, 0, len(items))
+	for _, item := range items {
+		result = append(result, domain.CommandTemplateVariable{
+			Name:         item.Name,
+			Label:        item.Label,
+			Placeholder:  item.Placeholder,
+			DefaultValue: item.DefaultValue,
+			Required:     item.Required,
+		})
+	}
+	return result
 }
 
 type commandExecutePayload struct {
@@ -48,12 +88,110 @@ func NewCommandHandler(service *service.CommandService, audit ...AuditEventWrite
 	return handler
 }
 
-func RegisterCommandTemplateRoutes(r chi.Router, h *CommandHandler) {
+func RegisterCommandTemplateReadRoutes(r chi.Router, h *CommandHandler) {
 	if h == nil {
 		return
 	}
 
 	r.Get("/api/commands/templates", h.ListTemplates)
+}
+
+func RegisterCommandTemplateWriteRoutes(r chi.Router, h *CommandHandler) {
+	if h == nil {
+		return
+	}
+
+	r.Post("/api/commands/templates", h.CreateTemplate)
+	r.Post("/api/commands/templates/{id}/favorite", h.SetTemplateFavorite)
+}
+
+func (h *CommandHandler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
+	user, ok := authctx.CurrentUser(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("请先登录"))
+		return
+	}
+
+	defer r.Body.Close()
+	var payload commandTemplateCreatePayload
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(payload.Scope) == domain.CommandTemplateScopeShared && !domain.CanManageInfrastructure(user.Role) {
+		writeError(w, http.StatusForbidden, errors.New("当前账号没有创建共享模板的权限"))
+		return
+	}
+
+	item, err := h.service.CreateTemplate(r.Context(), domain.CommandTemplateCreateInput{
+		Name:        payload.Name,
+		Description: payload.Description,
+		Command:     payload.Command,
+		Scope:       payload.Scope,
+		RiskLevel:   payload.RiskLevel,
+		Variables:   toCommandTemplateVariables(payload.Variables),
+	}, user.Username)
+	if err != nil {
+		if errors.Is(err, storage.ErrCommandTemplateAccessDenied) {
+			writeError(w, http.StatusForbidden, err)
+			return
+		}
+		var validationErr storage.CommandTemplateValidationError
+		if errors.As(err, &validationErr) {
+			writeError(w, http.StatusBadRequest, validationErr)
+			return
+		}
+		var conflictErr storage.CommandTemplateConflictError
+		if errors.As(err, &conflictErr) {
+			writeError(w, http.StatusConflict, errors.New("命令模板已存在"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, errors.New("创建命令模板失败"))
+		return
+	}
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (h *CommandHandler) SetTemplateFavorite(w http.ResponseWriter, r *http.Request) {
+	user, ok := authctx.CurrentUser(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("请先登录"))
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("template id 不能为空"))
+		return
+	}
+
+	defer r.Body.Close()
+	var payload commandTemplateFavoritePayload
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.service.SetTemplateFavorite(r.Context(), id, user.Username, payload.Favorite); err != nil {
+		if errors.Is(err, storage.ErrCommandTemplateNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		if errors.Is(err, storage.ErrCommandTemplateAccessDenied) {
+			writeError(w, http.StatusForbidden, err)
+			return
+		}
+		var validationErr storage.CommandTemplateValidationError
+		if errors.As(err, &validationErr) {
+			writeError(w, http.StatusBadRequest, validationErr)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, errors.New("更新模板收藏失败"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"favorite": payload.Favorite})
 }
 
 func RegisterCommandHistoryRoutes(r chi.Router, h *CommandHandler) {
@@ -65,7 +203,7 @@ func RegisterCommandHistoryRoutes(r chi.Router, h *CommandHandler) {
 }
 
 func RegisterCommandReadRoutes(r chi.Router, h *CommandHandler) {
-	RegisterCommandTemplateRoutes(r, h)
+	RegisterCommandTemplateReadRoutes(r, h)
 	RegisterCommandHistoryRoutes(r, h)
 }
 
@@ -74,6 +212,7 @@ func RegisterCommandWriteRoutes(r chi.Router, h *CommandHandler) {
 		return
 	}
 
+	RegisterCommandTemplateWriteRoutes(r, h)
 	r.Post("/api/servers/{id}/commands/execute", h.Execute)
 	r.Post("/api/commands/execute", h.ExecuteBatch)
 }
