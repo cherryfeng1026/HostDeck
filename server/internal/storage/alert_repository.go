@@ -18,7 +18,10 @@ type AlertRepository struct {
 	masterKey string
 }
 
-var ErrAlertActionNotAllowed = errors.New("当前告警状态不支持该操作")
+var (
+	ErrAlertActionNotAllowed = errors.New("当前告警状态不支持该操作")
+	ErrAlertRuleNotFound     = errors.New("告警规则不存在")
+)
 
 type AlertActionNotAllowedError struct {
 	Action string
@@ -44,22 +47,28 @@ func (e AlertActionNotAllowedError) Is(target error) bool {
 	return target == ErrAlertActionNotAllowed
 }
 
+type AlertNotificationDeliveryBuilder func(domain.AlertState) (domain.AlertNotificationDelivery, string, bool, error)
+
+type AlertNotificationDeliveryCreated func(domain.AlertNotificationDelivery)
+
 type AlertEvaluationRecord struct {
-	RuleID          int64
-	ServerID        int64
-	Metric          string
-	Operator        string
-	Threshold       float64
-	CurrentValue    float64
-	Severity        string
-	Message         string
-	DurationSeconds int
-	TriggeredAt     time.Time
-	LastTriggeredAt time.Time
-	Status          string
-	AcknowledgedAt  *time.Time
-	AcknowledgedBy  string
-	MutedUntil      *time.Time
+	RuleID                      int64
+	ServerID                    int64
+	Metric                      string
+	Operator                    string
+	Threshold                   float64
+	CurrentValue                float64
+	Severity                    string
+	Message                     string
+	DurationSeconds             int
+	TriggeredAt                 time.Time
+	LastTriggeredAt             time.Time
+	Status                      string
+	AcknowledgedAt              *time.Time
+	AcknowledgedBy              string
+	MutedUntil                  *time.Time
+	NotificationDeliveryBuilder AlertNotificationDeliveryBuilder
+	NotificationDeliveryCreated AlertNotificationDeliveryCreated
 }
 
 type AlertMutationRecord struct {
@@ -91,7 +100,7 @@ func NewAlertRepository(db *sql.DB, masterKey ...string) *AlertRepository {
 func (r *AlertRepository) List(ctx context.Context) ([]domain.AlertRule, error) {
 	rows, err := r.db.QueryContext(
 		ctx,
-		`SELECT id, metric, operator, threshold, duration_seconds, enabled, created_at, updated_at
+		`SELECT id, metric, operator, threshold, duration_seconds, enabled, scope_type, scope_value, created_at, updated_at
 		   FROM alert_rules
 		  ORDER BY id ASC`,
 	)
@@ -115,13 +124,15 @@ func (r *AlertRepository) Create(ctx context.Context, rule domain.AlertRule) err
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := r.db.ExecContext(
 		ctx,
-		`INSERT INTO alert_rules (metric, operator, threshold, duration_seconds, enabled, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		`INSERT INTO alert_rules (metric, operator, threshold, duration_seconds, enabled, scope_type, scope_value, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		rule.Metric,
 		rule.Operator,
 		rule.Threshold,
 		rule.DurationSeconds,
 		boolToInt(rule.Enabled),
+		normalizeAlertRuleScopeType(rule.ScopeType),
+		normalizeAlertRuleScopeValue(rule.ScopeType, rule.ScopeValue),
 		now,
 		now,
 	)
@@ -129,20 +140,120 @@ func (r *AlertRepository) Create(ctx context.Context, rule domain.AlertRule) err
 }
 
 func (r *AlertRepository) Update(ctx context.Context, rule domain.AlertRule) error {
-	_, err := r.db.ExecContext(
+	result, err := r.db.ExecContext(
 		ctx,
 		`UPDATE alert_rules
-		    SET metric = $1, operator = $2, threshold = $3, duration_seconds = $4, enabled = $5, updated_at = $6
-		  WHERE id = $7`,
+		    SET metric = $1, operator = $2, threshold = $3, duration_seconds = $4, enabled = $5, scope_type = $6, scope_value = $7, updated_at = $8
+		  WHERE id = $9`,
 		rule.Metric,
 		rule.Operator,
 		rule.Threshold,
 		rule.DurationSeconds,
 		boolToInt(rule.Enabled),
+		normalizeAlertRuleScopeType(rule.ScopeType),
+		normalizeAlertRuleScopeValue(rule.ScopeType, rule.ScopeValue),
 		time.Now().UTC().Format(time.RFC3339Nano),
 		rule.ID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrAlertRuleNotFound
+	}
+	return nil
+}
+
+func (r *AlertRepository) Delete(ctx context.Context, id int64) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM alert_rules WHERE id = $1)`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrAlertRuleNotFound
+	}
+
+	rows, err := tx.QueryContext(
+		ctx,
+		`SELECT id, rule_id, server_id, metric, operator, threshold, current_value, severity, message,
+		        status, duration_seconds, first_triggered_at, last_triggered_at, acknowledged_at,
+		        acknowledged_by, muted_until, created_at, updated_at
+		   FROM alert_states
+		  WHERE rule_id = $1`,
+		id,
+	)
+	if err != nil {
+		return err
+	}
+	states := make([]domain.AlertState, 0)
+	for rows.Next() {
+		state, err := scanAlertState(rows)
+		if err != nil {
+			_ = rows.Close()
+			return err
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	for _, state := range states {
+		if state.Status == domain.AlertStatusPending {
+			continue
+		}
+		if err := insertAlertHistoryTx(ctx, tx, AlertMutationRecord{
+			AlertID:      state.ID,
+			RuleID:       state.RuleID,
+			ServerID:     state.ServerID,
+			EventType:    domain.AlertEventResolved,
+			Metric:       state.Metric,
+			Operator:     state.Operator,
+			Threshold:    state.Threshold,
+			CurrentValue: state.CurrentValue,
+			Severity:     state.Severity,
+			Message:      state.Message,
+			Status:       state.Status,
+			TriggeredAt:  state.FirstTriggeredAt,
+			CreatedAt:    now,
+			Detail:       "规则已删除",
+		}); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM alert_states WHERE rule_id = $1`, id); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM alert_rules WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrAlertRuleNotFound
+	}
+	return tx.Commit()
 }
 
 func (r *AlertRepository) UpsertEvaluation(ctx context.Context, record AlertEvaluationRecord) (domain.AlertState, bool, error) {
@@ -269,6 +380,20 @@ func (r *AlertRepository) UpsertEvaluation(ctx context.Context, record AlertEval
 		return domain.AlertState{}, false, err
 	}
 
+	var createdDelivery domain.AlertNotificationDelivery
+	if record.NotificationDeliveryBuilder != nil {
+		delivery, payload, ok, err := record.NotificationDeliveryBuilder(state)
+		if err != nil {
+			return domain.AlertState{}, false, err
+		}
+		if ok {
+			createdDelivery, err = insertAlertNotificationDeliveryTx(ctx, tx, delivery, payload)
+			if err != nil {
+				return domain.AlertState{}, false, err
+			}
+		}
+	}
+
 	if created && state.Status != domain.AlertStatusPending {
 		if err := insertAlertHistoryTx(ctx, tx, AlertMutationRecord{
 			AlertID:      state.ID,
@@ -310,6 +435,9 @@ func (r *AlertRepository) UpsertEvaluation(ctx context.Context, record AlertEval
 
 	if err := tx.Commit(); err != nil {
 		return domain.AlertState{}, false, err
+	}
+	if record.NotificationDeliveryCreated != nil && createdDelivery.ID != 0 {
+		record.NotificationDeliveryCreated(createdDelivery)
 	}
 	return state, created, nil
 }
@@ -568,6 +696,7 @@ func (r *AlertRepository) SearchHistory(ctx context.Context, query string, limit
 func (r *AlertRepository) listHistory(ctx context.Context, limit int, query string, eventTypes []string) ([]domain.AlertHistoryEvent, error) {
 	args := []any{}
 	clauses := make([]string, 0, 2)
+	serverNameExpression := "COALESCE(NULLIF(h.server_name, ''), s.name, '')"
 
 	eventTypes = normalizeAlertHistoryEventTypes(eventTypes)
 	if len(eventTypes) > 0 {
@@ -583,19 +712,19 @@ func (r *AlertRepository) listHistory(ctx context.Context, limit int, query stri
 		args = append(args, "%"+strings.ToLower(query)+"%")
 		placeholder := fmt.Sprintf("$%d", len(args))
 		clauses = append(clauses, fmt.Sprintf(`(
-			LOWER(COALESCE(s.name, '')) LIKE %s OR
+			LOWER(%s) LIKE %s OR
 			LOWER(h.message) LIKE %s OR
 			LOWER(h.metric) LIKE %s OR
 			LOWER(h.detail) LIKE %s OR
 			LOWER(h.actor_username) LIKE %s
-		)`, placeholder, placeholder, placeholder, placeholder, placeholder))
+		)`, serverNameExpression, placeholder, placeholder, placeholder, placeholder, placeholder))
 	}
 
-	statement := `SELECT h.id, h.alert_id, h.rule_id, h.server_id, COALESCE(s.name, ''), h.event_type, h.metric,
+	statement := fmt.Sprintf(`SELECT h.id, h.alert_id, h.rule_id, h.server_id, %s, h.event_type, h.metric,
 	        h.operator, h.threshold, h.current_value, h.severity, h.message, h.status,
 	        h.triggered_at, h.created_at, h.actor_username, h.detail
 	   FROM alert_history h
-	   LEFT JOIN servers s ON s.id = h.server_id`
+	   LEFT JOIN servers s ON s.id = h.server_id`, serverNameExpression)
 	if len(clauses) > 0 {
 		statement += " WHERE " + strings.Join(clauses, " AND ")
 	}
@@ -656,6 +785,117 @@ func (r *AlertRepository) DeleteHistoryBefore(ctx context.Context, cutoff time.T
 		cutoff.UTC().Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func (r *AlertRepository) CreateNotificationDelivery(ctx context.Context, delivery domain.AlertNotificationDelivery, payload string) (domain.AlertNotificationDelivery, error) {
+	return insertAlertNotificationDelivery(ctx, r.db, delivery, payload)
+}
+
+type alertNotificationDeliveryInserter interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func insertAlertNotificationDelivery(ctx context.Context, inserter alertNotificationDeliveryInserter, delivery domain.AlertNotificationDelivery, payload string) (domain.AlertNotificationDelivery, error) {
+	now := time.Now().UTC()
+	occurredAt := delivery.OccurredAt.UTC()
+	if occurredAt.IsZero() {
+		occurredAt = now
+	}
+	row := inserter.QueryRowContext(
+		ctx,
+		`INSERT INTO alert_notification_deliveries (
+			event_type, alert_id, rule_id, server_id, server_name, status, attempt_count,
+			next_attempt_at, last_attempt_at, last_error, payload, occurred_at, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, 0, NULL, NULL, '', $7, $8, $9, $9)
+		RETURNING id, event_type, alert_id, rule_id, server_id, server_name, status, attempt_count,
+		          next_attempt_at, last_attempt_at, last_error, payload, occurred_at, created_at, updated_at`,
+		delivery.EventType,
+		delivery.AlertID,
+		delivery.RuleID,
+		delivery.ServerID,
+		delivery.ServerName,
+		normalizeNotificationDeliveryStatus(delivery.Status),
+		strings.TrimSpace(payload),
+		occurredAt.Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+	)
+	return scanAlertNotificationDelivery(row)
+}
+
+func insertAlertNotificationDeliveryTx(ctx context.Context, tx *sql.Tx, delivery domain.AlertNotificationDelivery, payload string) (domain.AlertNotificationDelivery, error) {
+	return insertAlertNotificationDelivery(ctx, tx, delivery, payload)
+}
+
+func (r *AlertRepository) RecordNotificationDeliveryAttempt(ctx context.Context, deliveryID int64, status string, lastError string, nextAttemptAt *time.Time, attemptedAt time.Time) error {
+	attemptedAt = attemptedAt.UTC()
+	if attemptedAt.IsZero() {
+		attemptedAt = time.Now().UTC()
+	}
+	_, err := r.db.ExecContext(
+		ctx,
+		`UPDATE alert_notification_deliveries
+		    SET status = $1,
+		        attempt_count = attempt_count + 1,
+		        next_attempt_at = $2,
+		        last_attempt_at = $3,
+		        last_error = $4,
+		        updated_at = $3
+		  WHERE id = $5`,
+		normalizeNotificationDeliveryStatus(status),
+		nullableRFC3339(nextAttemptAt),
+		attemptedAt.Format(time.RFC3339Nano),
+		truncateNotificationDeliveryError(lastError),
+		deliveryID,
+	)
+	return err
+}
+
+func (r *AlertRepository) ListNotificationDeliveries(ctx context.Context, filter domain.AlertNotificationDeliveryFilter) ([]domain.AlertNotificationDelivery, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	args := make([]any, 0, 2)
+	clauses := make([]string, 0, 2)
+	if status := strings.TrimSpace(filter.Status); status != "" {
+		args = append(args, normalizeNotificationDeliveryStatus(status))
+		clauses = append(clauses, fmt.Sprintf("status = $%d", len(args)))
+	}
+	if filter.DueOnly {
+		now := filter.Now.UTC()
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		args = append(args, now.Format(time.RFC3339Nano))
+		clauses = append(clauses, fmt.Sprintf("status IN ('%s', '%s') AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= $%d)", domain.AlertNotificationDeliveryPending, domain.AlertNotificationDeliveryFailed, len(args)))
+	}
+	statement := `SELECT id, event_type, alert_id, rule_id, server_id, server_name, status, attempt_count,
+	       next_attempt_at, last_attempt_at, last_error, payload, occurred_at, created_at, updated_at
+	  FROM alert_notification_deliveries`
+	if len(clauses) > 0 {
+		statement += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	args = append(args, limit)
+	statement += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d", len(args))
+
+	rows, err := r.db.QueryContext(ctx, statement, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]domain.AlertNotificationDelivery, 0)
+	for rows.Next() {
+		item, err := scanAlertNotificationDelivery(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (r *AlertRepository) GetNotificationSettings(ctx context.Context) (domain.AlertNotificationSettings, error) {
@@ -755,9 +995,9 @@ func insertAlertHistoryTx(ctx context.Context, tx *sql.Tx, event AlertMutationRe
 	_, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO alert_history (
-			alert_id, rule_id, server_id, event_type, metric, operator, threshold, current_value,
+			alert_id, rule_id, server_id, server_name, event_type, metric, operator, threshold, current_value,
 			severity, message, status, triggered_at, created_at, actor_username, detail
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		) VALUES ($1, $2, $3, COALESCE((SELECT name FROM servers WHERE id = $3), ''), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
 		event.AlertID,
 		event.RuleID,
 		event.ServerID,
@@ -781,11 +1021,13 @@ func scanAlertRule(scanner interface {
 	Scan(dest ...any) error
 }) (domain.AlertRule, error) {
 	var (
-		item      domain.AlertRule
-		enabled   int
-		createdAt string
-		updatedAt string
-		err       error
+		item       domain.AlertRule
+		enabled    int
+		scopeType  string
+		scopeValue string
+		createdAt  string
+		updatedAt  string
+		err        error
 	)
 
 	if err = scanner.Scan(
@@ -795,6 +1037,8 @@ func scanAlertRule(scanner interface {
 		&item.Threshold,
 		&item.DurationSeconds,
 		&enabled,
+		&scopeType,
+		&scopeValue,
 		&createdAt,
 		&updatedAt,
 	); err != nil {
@@ -802,6 +1046,8 @@ func scanAlertRule(scanner interface {
 	}
 
 	item.Enabled = enabled == 1
+	item.ScopeType = normalizeAlertRuleScopeType(scopeType)
+	item.ScopeValue = normalizeAlertRuleScopeValue(item.ScopeType, scopeValue)
 	item.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
 		return domain.AlertRule{}, err
@@ -809,6 +1055,58 @@ func scanAlertRule(scanner interface {
 	item.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt)
 	if err != nil {
 		return domain.AlertRule{}, err
+	}
+	return item, nil
+}
+
+func scanAlertNotificationDelivery(scanner interface {
+	Scan(dest ...any) error
+}) (domain.AlertNotificationDelivery, error) {
+	var (
+		item          domain.AlertNotificationDelivery
+		nextAttemptAt sql.NullString
+		lastAttemptAt sql.NullString
+		occurredAt    string
+		createdAt     string
+		updatedAt     string
+	)
+	if err := scanner.Scan(
+		&item.ID,
+		&item.EventType,
+		&item.AlertID,
+		&item.RuleID,
+		&item.ServerID,
+		&item.ServerName,
+		&item.Status,
+		&item.AttemptCount,
+		&nextAttemptAt,
+		&lastAttemptAt,
+		&item.LastError,
+		&item.Payload,
+		&occurredAt,
+		&createdAt,
+		&updatedAt,
+	); err != nil {
+		return domain.AlertNotificationDelivery{}, err
+	}
+	var err error
+	item.Status = normalizeNotificationDeliveryStatus(item.Status)
+	item.NextAttemptAt, err = parseNullableRFC3339(nextAttemptAt)
+	if err != nil {
+		return domain.AlertNotificationDelivery{}, err
+	}
+	item.LastAttemptAt, err = parseNullableRFC3339(lastAttemptAt)
+	if err != nil {
+		return domain.AlertNotificationDelivery{}, err
+	}
+	if item.OccurredAt, err = time.Parse(time.RFC3339Nano, occurredAt); err != nil {
+		return domain.AlertNotificationDelivery{}, err
+	}
+	if item.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return domain.AlertNotificationDelivery{}, err
+	}
+	if item.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt); err != nil {
+		return domain.AlertNotificationDelivery{}, err
 	}
 	return item, nil
 }
@@ -976,4 +1274,43 @@ func nullableRFC3339(value *time.Time) any {
 		return nil
 	}
 	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func normalizeAlertRuleScopeType(value string) string {
+	switch strings.TrimSpace(value) {
+	case domain.AlertRuleScopeServer:
+		return domain.AlertRuleScopeServer
+	case domain.AlertRuleScopeTag:
+		return domain.AlertRuleScopeTag
+	case domain.AlertRuleScopePurpose:
+		return domain.AlertRuleScopePurpose
+	default:
+		return domain.AlertRuleScopeAll
+	}
+}
+
+func normalizeAlertRuleScopeValue(scopeType string, value string) string {
+	if normalizeAlertRuleScopeType(scopeType) == domain.AlertRuleScopeAll {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func normalizeNotificationDeliveryStatus(value string) string {
+	switch strings.TrimSpace(value) {
+	case domain.AlertNotificationDeliverySent:
+		return domain.AlertNotificationDeliverySent
+	case domain.AlertNotificationDeliveryFailed:
+		return domain.AlertNotificationDeliveryFailed
+	default:
+		return domain.AlertNotificationDeliveryPending
+	}
+}
+
+func truncateNotificationDeliveryError(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 1024 {
+		return value
+	}
+	return value[:1024]
 }

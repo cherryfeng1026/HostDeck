@@ -139,6 +139,38 @@ func (r *CommandTemplateRepository) List(ctx context.Context, filter domain.Comm
 	return items, rows.Err()
 }
 
+func (r *CommandTemplateRepository) GetByID(ctx context.Context, templateID string, username string) (domain.CommandTemplate, error) {
+	templateID = strings.TrimSpace(templateID)
+	username = strings.TrimSpace(username)
+	if templateID == "" {
+		return domain.CommandTemplate{}, ErrCommandTemplateNotFound
+	}
+	row := r.db.QueryRowContext(
+		ctx,
+		`SELECT
+			ct.id,
+			ct.name,
+			ct.description,
+			ct.command_text,
+			ct.scope,
+			ct.risk_level,
+			ct.created_by,
+			ct.variables_json,
+			0 AS is_favorite
+		FROM command_templates ct
+		WHERE ct.id = $1 AND (ct.scope = $2 OR (ct.scope = $3 AND ct.created_by = $4))`,
+		templateID,
+		domain.CommandTemplateScopeShared,
+		domain.CommandTemplateScopePersonal,
+		username,
+	)
+	item, err := scanCommandTemplate(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.CommandTemplate{}, ErrCommandTemplateNotFound
+	}
+	return item, err
+}
+
 func (r *CommandTemplateRepository) Create(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error) {
 	username = strings.TrimSpace(username)
 	normalized, err := normalizeCommandTemplateInput(input, username)

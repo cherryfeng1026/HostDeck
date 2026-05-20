@@ -3,41 +3,51 @@ import {
   NButton,
   NInput,
   NInputNumber,
+  NPagination,
   NScrollbar,
-  NSelect,
   NSwitch,
   NTabPane,
   NTabs,
   NTag,
   useMessage,
 } from 'naive-ui'
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { useAutoRefresh } from '../auto-refresh'
+import {
+  loadAlerts,
+  prependCachedAlertHistory,
+  removeCachedAlert,
+  setCachedAlertNotificationSettings,
+  useAlertCache,
+} from '../dashboard-cache'
 import {
   ackAlert,
-  createAlertRule,
-  getAlertHistory,
-  getAlertNotificationSettings,
-  getAlertRules,
-  getAlerts,
-  muteAlert,
+  testAlertNotificationSettings,
   updateAlertNotificationSettings,
-  updateAlertRule,
 } from '../services/api'
 import { useSession } from '../session'
-import type { AlertEvent, AlertHistoryEvent, AlertNotificationSettings, AlertRule } from '../types'
+import type { AlertEvent, AlertHistoryEvent, AlertNotificationSettings } from '../types'
 
 const message = useMessage()
 const router = useRouter()
 const { canManageInfrastructure } = useSession()
-const alerts = ref<AlertEvent[]>([])
-const historyItems = ref<AlertHistoryEvent[]>([])
-const rules = ref<AlertRule[]>([])
-const loading = ref(false)
-const savingRule = ref(false)
+const alertCache = useAlertCache()
+
+const alerts = computed(() => alertCache.alerts)
+const historyItems = computed(() => alertCache.historyItems)
+const rules = computed(() => alertCache.rules)
+const loading = computed(() => alertCache.loading)
 const savingNotificationSettings = ref(false)
-const editingRuleId = ref<number | null>(null)
+const testingNotification = ref(false)
 const actingAlertId = ref<number | null>(null)
+const activeTab = ref('active')
+const activeAlertFilter = ref<'all' | 'critical' | 'warning'>('all')
+const activePage = ref(1)
+const historyPage = ref(1)
+const notificationPanel = ref<HTMLElement | null>(null)
+const notificationHighlighted = ref(false)
+const pageSize = 6
 
 const notificationSettings = reactive<AlertNotificationSettings>({
   enabled: false,
@@ -45,14 +55,6 @@ const notificationSettings = reactive<AlertNotificationSettings>({
   webhookConfigured: false,
   clearWebhookURL: false,
   webhookTimeoutSeconds: 5,
-})
-
-const ruleForm = reactive({
-  metric: 'online',
-  operator: 'eq',
-  threshold: 0,
-  durationSeconds: 60,
-  enabled: true,
 })
 
 const metricOptions = [
@@ -70,91 +72,97 @@ const operatorOptions = [
   { label: '小于等于', value: 'lte' },
 ]
 
-const muteDurationOptions = [
-  { label: '15 分钟', value: 15 },
-  { label: '30 分钟', value: 30 },
-  { label: '1 小时', value: 60 },
-  { label: '4 小时', value: 240 },
-]
-
-const muteDurationByAlertId = ref<Record<number, number>>({})
-
-async function loadData() {
-  loading.value = true
-  try {
-    const [alertList, alertHistory, ruleList, alertNotificationConfig] = await Promise.all([
-      getAlerts(),
-      getAlertHistory(),
-      getAlertRules(),
-      canManageInfrastructure.value ? getAlertNotificationSettings() : Promise.resolve(null),
-    ])
-    alerts.value = alertList
-    historyItems.value = alertHistory
-    rules.value = ruleList
-    if (alertNotificationConfig) {
-      notificationSettings.enabled = alertNotificationConfig.enabled
-      notificationSettings.webhookURL = alertNotificationConfig.webhookURL
-      notificationSettings.webhookConfigured = !!alertNotificationConfig.webhookConfigured
-      notificationSettings.clearWebhookURL = false
-      notificationSettings.webhookTimeoutSeconds = alertNotificationConfig.webhookTimeoutSeconds
-    } else {
-      notificationSettings.enabled = false
-      notificationSettings.webhookURL = ''
-      notificationSettings.webhookConfigured = false
-      notificationSettings.clearWebhookURL = false
-      notificationSettings.webhookTimeoutSeconds = 5
-    }
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载告警数据失败')
-  } finally {
-    loading.value = false
+const activeAlerts = computed(() => alerts.value.filter((alert) => alert.status === 'active'))
+const filteredActiveAlerts = computed(() => {
+  if (activeAlertFilter.value === 'critical') {
+    return activeAlerts.value.filter((alert) => alert.severity === 'critical')
   }
+  if (activeAlertFilter.value === 'warning') {
+    return activeAlerts.value.filter((alert) => alert.severity !== 'critical')
+  }
+  return activeAlerts.value
+})
+const criticalActiveCount = computed(() => activeAlerts.value.filter((alert) => alert.severity === 'critical').length)
+const warningActiveCount = computed(() => activeAlerts.value.filter((alert) => alert.severity !== 'critical').length)
+const enabledRuleCount = computed(() => rules.value.filter((rule) => rule.enabled).length)
+const webhookStatusText = computed(() => (notificationSettings.enabled ? '正常' : '未启用'))
+const activeAlertPageItems = computed(() => paginateItems(filteredActiveAlerts.value, activePage.value, pageSize))
+const historyPageItems = computed(() => paginateItems(historyItems.value, historyPage.value, pageSize))
+const activePageCount = computed(() => Math.max(1, Math.ceil(filteredActiveAlerts.value.length / pageSize)))
+const historyPageCount = computed(() => Math.max(1, Math.ceil(historyItems.value.length / pageSize)))
+const activeFilterLabel = computed(() => {
+  switch (activeAlertFilter.value) {
+    case 'critical':
+      return '严重告警'
+    case 'warning':
+      return '警告告警'
+    default:
+      return '全部活动告警'
+  }
+})
+
+async function loadData(force = false, silent = false) {
+  try {
+    await loadAlerts(canManageInfrastructure.value, { force, silent })
+    syncNotificationSettings(alertCache.notificationSettings)
+  } catch (error) {
+    if (!silent) {
+      message.error(error instanceof Error ? error.message : '加载告警数据失败')
+    }
+  }
+}
+
+function syncNotificationSettings(settings: AlertNotificationSettings | null) {
+  if (!settings) {
+    notificationSettings.enabled = false
+    notificationSettings.webhookURL = ''
+    notificationSettings.webhookConfigured = false
+    notificationSettings.clearWebhookURL = false
+    notificationSettings.webhookTimeoutSeconds = 5
+    return
+  }
+  notificationSettings.enabled = settings.enabled
+  notificationSettings.webhookURL = settings.webhookURL
+  notificationSettings.webhookConfigured = !!settings.webhookConfigured
+  notificationSettings.clearWebhookURL = false
+  notificationSettings.webhookTimeoutSeconds = settings.webhookTimeoutSeconds
+}
+
+function prependHistoryItemFromAlert(alert: AlertEvent, actorUsername: string) {
+  const nextItem: AlertHistoryEvent = {
+    id: Date.now(),
+    alertId: alert.id,
+    ruleId: alert.ruleId,
+    serverId: alert.serverId,
+    serverName: alert.serverName,
+    eventType: 'acknowledged',
+    metric: alert.metric,
+    operator: alert.operator,
+    threshold: alert.threshold,
+    currentValue: alert.currentValue,
+    severity: alert.severity,
+    message: alert.message,
+    status: 'acknowledged',
+    triggeredAt: alert.triggeredAt,
+    createdAt: new Date().toISOString(),
+    actorUsername,
+    detail: 'operator confirmed',
+  }
+  prependCachedAlertHistory(nextItem)
 }
 
 async function handleAcknowledge(alert: AlertEvent) {
   actingAlertId.value = alert.id
   try {
-    await ackAlert(alert.id)
-    message.success('告警已确认')
-    await loadData()
+    const updatedAlert = await ackAlert(alert.id)
+    removeCachedAlert(alert.id)
+    prependHistoryItemFromAlert(updatedAlert, updatedAlert.acknowledgedBy || '当前用户')
+    await loadData(true, true)
+    message.success('告警已确认并归入历史')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '确认告警失败')
   } finally {
     actingAlertId.value = null
-  }
-}
-
-async function handleMute(alert: AlertEvent) {
-  actingAlertId.value = alert.id
-  const durationMinutes = muteDurationByAlertId.value[alert.id] || 30
-  try {
-    await muteAlert(alert.id, durationMinutes)
-    message.success(`告警已静默 ${formatMuteDuration(durationMinutes)}`)
-    await loadData()
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : '静默告警失败')
-  } finally {
-    actingAlertId.value = null
-  }
-}
-
-async function handleSubmitRule() {
-  savingRule.value = true
-  try {
-    const payload = { ...ruleForm }
-    if (editingRuleId.value) {
-      await updateAlertRule(editingRuleId.value, payload)
-      message.success('告警规则已更新')
-    } else {
-      await createAlertRule(payload)
-      message.success('告警规则已创建')
-    }
-    resetRuleForm()
-    await loadData()
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : '保存告警规则失败')
-  } finally {
-    savingRule.value = false
   }
 }
 
@@ -167,11 +175,9 @@ async function handleSubmitNotificationSettings() {
       clearWebhookURL: notificationSettings.clearWebhookURL,
       webhookTimeoutSeconds: notificationSettings.webhookTimeoutSeconds,
     })
-    notificationSettings.enabled = saved.enabled
-    notificationSettings.webhookURL = saved.webhookURL
-    notificationSettings.webhookConfigured = !!saved.webhookConfigured
-    notificationSettings.clearWebhookURL = false
-    notificationSettings.webhookTimeoutSeconds = saved.webhookTimeoutSeconds
+    setCachedAlertNotificationSettings(saved)
+    syncNotificationSettings(alertCache.notificationSettings)
+    await loadData(true, true)
     message.success('通知设置已保存')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '保存通知设置失败')
@@ -180,30 +186,25 @@ async function handleSubmitNotificationSettings() {
   }
 }
 
-function startEditRule(rule: AlertRule) {
-  editingRuleId.value = rule.id
-  ruleForm.metric = rule.metric
-  ruleForm.operator = rule.operator
-  ruleForm.threshold = rule.threshold
-  ruleForm.durationSeconds = rule.durationSeconds
-  ruleForm.enabled = rule.enabled
-}
-
-function resetRuleForm() {
-  editingRuleId.value = null
-  ruleForm.metric = 'online'
-  ruleForm.operator = 'eq'
-  ruleForm.threshold = 0
-  ruleForm.durationSeconds = 60
-  ruleForm.enabled = true
-}
-
 function metricLabel(metric: string) {
   return metricOptions.find((item) => item.value === metric)?.label || metric
 }
 
 function operatorLabel(operator: string) {
   return operatorOptions.find((item) => item.value === operator)?.label || operator
+}
+
+async function handleTestNotification() {
+  testingNotification.value = true
+  try {
+    await testAlertNotificationSettings()
+    await loadData(true, true)
+    message.success('测试通知已发送')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '发送测试通知失败')
+  } finally {
+    testingNotification.value = false
+  }
 }
 
 function formatDateTime(value?: string) {
@@ -222,13 +223,6 @@ function formatDuration(start?: string, end?: string) {
   if (hours > 0) return `${hours} 小时 ${minutes} 分钟`
   if (minutes > 0) return `${minutes} 分钟 ${seconds} 秒`
   return `${seconds} 秒`
-}
-
-function formatMuteDuration(durationMinutes: number) {
-  if (durationMinutes % 60 === 0 && durationMinutes >= 60) {
-    return `${durationMinutes / 60} 小时`
-  }
-  return `${durationMinutes} 分钟`
 }
 
 function statusLabel(status: string) {
@@ -259,255 +253,330 @@ function historyEventLabel(eventType: string) {
   }
 }
 
+function eventIcon(eventType: string) {
+  switch (eventType) {
+    case 'triggered':
+      return '!'
+    case 'acknowledged':
+    case 'resolved':
+      return '✓'
+    case 'muted':
+      return '-'
+    default:
+      return 'i'
+  }
+}
+
+function eventTone(eventType: string, severity: string) {
+  if (eventType === 'acknowledged' || eventType === 'resolved') {
+    return 'resolved'
+  }
+  return severity === 'critical' ? 'critical' : 'warning'
+}
+
+function paginateItems<T>(items: T[], page: number, size: number) {
+  const start = (page - 1) * size
+  return items.slice(start, start + size)
+}
+
+function handleManualRefresh() {
+  void loadData(true)
+}
+
+function selectActiveAlertFilter(filter: 'all' | 'critical' | 'warning') {
+  activeAlertFilter.value = filter
+  activePage.value = 1
+  activeTab.value = 'active'
+}
+
+function openRulePage() {
+  void router.push('/alerts/rules')
+}
+
+function focusNotificationPanel() {
+  notificationPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  notificationHighlighted.value = true
+  window.setTimeout(() => {
+    notificationHighlighted.value = false
+  }, 900)
+}
+
+watch(canManageInfrastructure, () => {
+  void loadData(true, alertCache.initialized)
+})
+
+watch(filteredActiveAlerts, () => {
+  if (activePage.value > activePageCount.value) {
+    activePage.value = activePageCount.value
+  }
+})
+
+watch(historyItems, () => {
+  if (historyPage.value > historyPageCount.value) {
+    historyPage.value = historyPageCount.value
+  }
+})
+
+useAutoRefresh(() => loadData(false, true), 30000)
+
 onMounted(() => {
-  void loadData()
+  void loadData(false, alertCache.initialized)
 })
 </script>
 
 <template>
   <n-scrollbar class="content-scroll">
-    <div class="page-container">
+    <div class="page-container alert-page">
       <div class="page-header">
         <div class="header-text">
-          <h1>监控告警</h1>
-          <p>管理阈值规则，跟踪活动告警，并查看告警生命周期历史。</p>
+          <h1>系统告警</h1>
         </div>
         <div class="header-actions">
-          <n-button ghost @click="loadData" style="color: #a1a1aa; border-color: rgba(255,255,255,0.1)">
-            刷新数据
-          </n-button>
-          <n-tag v-if="!canManageInfrastructure" type="default" style="color: #a1a1aa; background: rgba(255,255,255,0.05)">
-            只读权限
-          </n-tag>
+          <n-button ghost :loading="loading" @click="handleManualRefresh">刷新</n-button>
+          <n-tag v-if="!canManageInfrastructure" type="default" bordered>只读</n-tag>
         </div>
       </div>
 
-      <div class="layout-grid">
-        <div class="bento-card alerts-panel">
-          <div class="card-title-bar">
-            <span class="card-title">告警中心</span>
-            <n-tag size="small" :type="alerts.length ? 'warning' : 'success'" bordered>
-              {{ alerts.length ? `${alerts.length} 条活动告警` : '当前平稳' }}
+      <section class="alert-summary-strip">
+        <button type="button" class="summary-cell danger" :class="{ active: activeAlertFilter === 'all' }" @click="selectActiveAlertFilter('all')">
+          <i class="summary-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 6.5-3 8.5-3 8.5h18S18 14.5 18 8" /><path d="M10 20a2 2 0 0 0 4 0" /></svg>
+          </i>
+          <span>当前告警</span>
+          <strong>{{ activeAlerts.length }}</strong>
+          <small>待确认</small>
+        </button>
+        <button type="button" class="summary-cell danger" :class="{ active: activeAlertFilter === 'critical' }" @click="selectActiveAlertFilter('critical')">
+          <i class="summary-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 4 21 20H3L12 4Z" /><path d="M12 9v5" /><path d="M12 17h.01" /></svg>
+          </i>
+          <span>严重告警</span>
+          <strong>{{ criticalActiveCount }}</strong>
+          <small>严重事件</small>
+        </button>
+        <button type="button" class="summary-cell warning" :class="{ active: activeAlertFilter === 'warning' }" @click="selectActiveAlertFilter('warning')">
+          <i class="summary-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 4 21 20H3L12 4Z" /><path d="M12 10v4" /><path d="M12 17h.01" /></svg>
+          </i>
+          <span>警告告警</span>
+          <strong>{{ warningActiveCount }}</strong>
+          <small>警告事件</small>
+        </button>
+        <button type="button" class="summary-cell info" @click="openRulePage">
+          <i class="summary-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M8 6h13" /><path d="M8 12h13" /><path d="M8 18h13" /><path d="m3 6 .8.8L5.5 5" /><path d="m3 12 .8.8 1.7-1.8" /><path d="m3 18 .8.8 1.7-1.8" /></svg>
+          </i>
+          <span>规则</span>
+          <strong>{{ enabledRuleCount }} / {{ rules.length }}</strong>
+          <small>已启用</small>
+        </button>
+        <button type="button" class="summary-cell success" :class="{ active: notificationHighlighted }" @click="focusNotificationPanel">
+          <i class="summary-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M4 12h4l4-5v10l-4-5H4Z" /><path d="M16 9.5a4 4 0 0 1 0 5" /><path d="M18.5 7a7 7 0 0 1 0 10" /></svg>
+          </i>
+          <span>告警通知</span>
+          <strong>{{ webhookStatusText }}</strong>
+          <small>{{ notificationSettings.webhookConfigured ? '已配置' : '未配置' }}</small>
+        </button>
+      </section>
+
+      <div class="alert-workspace">
+        <section class="alert-board">
+          <div class="board-head">
+            <div>
+              <strong>告警处理</strong>
+              <span>{{ activeAlerts.length ? `${activeFilterLabel} · ${filteredActiveAlerts.length} / ${activeAlerts.length} 条` : '当前无活动告警' }}</span>
+            </div>
+            <n-tag size="small" :type="activeAlerts.length ? 'warning' : 'success'" bordered>
+              {{ activeAlerts.length ? '需要确认' : '稳定' }}
             </n-tag>
           </div>
 
-          <n-tabs type="line" animated>
-            <n-tab-pane name="active" :tab="`活动告警 (${alerts.length})`">
-              <div v-if="!alerts.length" class="empty-state">
-                当前没有正式活动告警。
-              </div>
-              <div v-else class="timeline-container">
-                <div v-for="alert in alerts" :key="alert.id" class="alert-card">
-                  <div class="alert-icon" :class="alert.severity">
-                    <span v-if="alert.severity === 'critical'">!</span>
-                    <span v-else>i</span>
+          <n-tabs v-model:value="activeTab" type="line" animated class="alert-tabs">
+            <n-tab-pane name="active" :tab="`活动告警 (${activeAlerts.length})`">
+              <div class="alert-pane">
+                <div class="alert-list-region">
+                  <div v-if="!filteredActiveAlerts.length" class="empty-state">
+                    {{ activeAlerts.length ? '当前筛选条件下没有活动告警。' : '当前没有需要确认的活动告警。' }}
                   </div>
-                  <div class="alert-content">
-                    <div class="alert-header">
-                      <span class="alert-server" @click="router.push(`/servers/${alert.serverId}`)">{{ alert.serverName }}</span>
-                      <span class="alert-time">{{ formatDateTime(alert.lastTriggeredAt) }}</span>
-                    </div>
-                    <div class="alert-message">{{ alert.message }}</div>
-                    <div class="alert-meta">
-                      <n-tag :type="alert.severity === 'critical' ? 'error' : 'warning'" size="small" bordered>
-                        {{ alert.severity === 'critical' ? '严重' : '警告' }}
-                      </n-tag>
-                      <n-tag size="small" bordered type="info">{{ statusLabel(alert.status) }}</n-tag>
-                      <span class="meta-text">持续 {{ formatDuration(alert.triggeredAt, alert.lastTriggeredAt) }}</span>
-                      <span v-if="alert.durationSeconds > 0" class="meta-text">规则窗口 {{ alert.durationSeconds }} 秒</span>
-                      <span v-if="alert.acknowledgedBy" class="meta-text">确认人 {{ alert.acknowledgedBy }}</span>
-                      <span v-if="alert.mutedUntil" class="meta-text">静默至 {{ formatDateTime(alert.mutedUntil) }}</span>
-                    </div>
-                    <div class="alert-footer">
-                      <n-button size="small" ghost type="primary" @click="router.push(`/servers/${alert.serverId}`)">
-                        查看服务器
-                      </n-button>
-                      <div v-if="canManageInfrastructure" class="inline-actions">
-                        <n-button
-                          v-if="alert.status === 'active'"
-                          size="small"
-                          ghost
-                          @click="handleAcknowledge(alert)"
-                          :loading="actingAlertId === alert.id"
-                        >
-                          确认
-                        </n-button>
-                        <template v-if="alert.status !== 'muted'">
-                          <n-select
-                            :value="muteDurationByAlertId[alert.id] || 30"
-                            :options="muteDurationOptions"
-                            size="small"
-                            consistent-menu-width
-                            class="mute-select"
-                            @update:value="(value: number) => (muteDurationByAlertId[alert.id] = value)"
-                          />
-                          <n-button
-                            size="small"
-                            ghost
-                            type="warning"
-                            @click="handleMute(alert)"
-                            :loading="actingAlertId === alert.id"
-                          >
-                            静默
-                          </n-button>
-                        </template>
-                      </div>
-                    </div>
+                  <div v-else class="alert-table-wrap">
+                    <table class="alert-table">
+                      <colgroup>
+                        <col style="width: 176px" />
+                        <col style="width: 82px" />
+                        <col style="width: 70px" />
+                        <col style="width: 70px" />
+                        <col style="width: 104px" />
+                        <col style="width: 74px" />
+                        <col style="width: 94px" />
+                      </colgroup>
+                      <thead>
+                        <tr>
+                          <th>告警项</th>
+                          <th>主机</th>
+                          <th>阈值</th>
+                          <th>当前值</th>
+                          <th>首次发生</th>
+                          <th>状态</th>
+                          <th>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="alert in activeAlertPageItems" :key="alert.id">
+                          <td>
+                            <div class="alert-name-cell">
+                              <span class="severity-dot" :class="alert.severity" />
+                              <div>
+                                <strong>{{ alert.message }}</strong>
+                                <small>{{ metricLabel(alert.metric) }}</small>
+                              </div>
+                            </div>
+                          </td>
+                          <td>
+                            <button type="button" class="alert-server" @click="router.push(`/servers/${alert.serverId}`)">
+                              {{ alert.serverName || `#${alert.serverId}` }}
+                            </button>
+                          </td>
+                          <td class="muted-cell">{{ operatorLabel(alert.operator) }} {{ alert.threshold }}</td>
+                          <td :class="alert.severity === 'critical' ? 'danger-cell' : 'warning-cell'">{{ alert.currentValue }}</td>
+                          <td>
+                            <span>{{ formatDateTime(alert.triggeredAt) }}</span>
+                            <small class="block-muted">{{ formatDuration(alert.triggeredAt, alert.lastTriggeredAt) }}</small>
+                          </td>
+                          <td>
+                            <n-tag :type="alert.severity === 'critical' ? 'error' : 'warning'" size="small" bordered>
+                              {{ statusLabel(alert.status) }}
+                            </n-tag>
+                          </td>
+                          <td>
+                            <div class="table-actions">
+                              <n-button size="small" type="primary" ghost @click="router.push(`/servers/${alert.serverId}`)">查看</n-button>
+                              <n-button
+                                v-if="canManageInfrastructure"
+                                size="small"
+                                type="primary"
+                                :loading="actingAlertId === alert.id"
+                                @click="handleAcknowledge(alert)"
+                              >
+                                确认
+                              </n-button>
+                            </div>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
                   </div>
+                </div>
+                <div v-if="filteredActiveAlerts.length > pageSize" class="alert-pager-slot">
+                  <n-pagination v-model:page="activePage" :page-count="activePageCount" class="pager" />
                 </div>
               </div>
             </n-tab-pane>
 
-            <n-tab-pane name="history" :tab="`历史事件 (${historyItems.length})`">
-              <div v-if="!historyItems.length" class="empty-state">
-                暂无告警历史事件。
-              </div>
-              <div v-else class="timeline-container">
-                <div v-for="item in historyItems" :key="item.id" class="alert-card history-card">
-                  <div class="alert-icon history-icon">
-                    <span>{{ historyEventLabel(item.eventType).slice(0, 1) }}</span>
+            <n-tab-pane name="history" :tab="`历史告警 (${historyItems.length})`">
+              <div class="alert-pane">
+                <div class="alert-list-region">
+                  <div v-if="!historyItems.length" class="empty-state">
+                    暂无告警历史事件。
                   </div>
-                  <div class="alert-content">
-                    <div class="alert-header">
-                      <span class="alert-server" @click="router.push(`/servers/${item.serverId}`)">{{ item.serverName }}</span>
-                      <span class="alert-time">{{ formatDateTime(item.createdAt) }}</span>
-                    </div>
-                    <div class="alert-message">{{ item.message }}</div>
-                    <div class="alert-meta">
-                      <n-tag size="small" bordered>{{ historyEventLabel(item.eventType) }}</n-tag>
-                      <n-tag :type="item.severity === 'critical' ? 'error' : 'warning'" size="small" bordered>
-                        {{ item.severity === 'critical' ? '严重' : '警告' }}
-                      </n-tag>
-                      <span class="meta-text">首次触发 {{ formatDateTime(item.triggeredAt) }}</span>
-                      <span v-if="item.actorUsername" class="meta-text">操作者 {{ item.actorUsername }}</span>
-                      <span v-if="item.detail" class="meta-text">{{ item.detail }}</span>
-                    </div>
+                  <div v-else class="alert-table-wrap">
+                    <table class="alert-table history-table">
+                      <colgroup>
+                        <col style="width: 122px" />
+                        <col style="width: 82px" />
+                        <col style="width: 176px" />
+                        <col style="width: 82px" />
+                        <col style="width: 68px" />
+                        <col style="width: 72px" />
+                        <col style="width: 72px" />
+                      </colgroup>
+                      <thead>
+                        <tr>
+                          <th>时间</th>
+                          <th>级别</th>
+                          <th>告警项</th>
+                          <th>主机</th>
+                          <th>事件</th>
+                          <th>确认人</th>
+                          <th>状态</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="item in historyPageItems" :key="item.id">
+                          <td>{{ formatDateTime(item.createdAt) }}</td>
+                          <td>
+                            <n-tag :type="item.severity === 'critical' ? 'error' : 'warning'" size="small" bordered>
+                              {{ item.severity === 'critical' ? '严重' : '警告' }}
+                            </n-tag>
+                          </td>
+                          <td>
+                            <strong class="table-strong">{{ item.message }}</strong>
+                            <small class="block-muted">{{ metricLabel(item.metric) }} {{ operatorLabel(item.operator) }} {{ item.threshold }}</small>
+                          </td>
+                          <td>
+                            <button type="button" class="alert-server" @click="router.push(`/servers/${item.serverId}`)">
+                              {{ item.serverName || `#${item.serverId}` }}
+                            </button>
+                          </td>
+                          <td>{{ historyEventLabel(item.eventType) }}</td>
+                          <td class="muted-cell">{{ item.actorUsername || '-' }}</td>
+                          <td>
+                            <n-tag size="small" bordered>{{ statusLabel(item.status) }}</n-tag>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
                   </div>
+                </div>
+                <div v-if="historyItems.length > pageSize" class="alert-pager-slot">
+                  <n-pagination v-model:page="historyPage" :page-count="historyPageCount" class="pager" />
                 </div>
               </div>
             </n-tab-pane>
           </n-tabs>
-        </div>
+        </section>
 
-        <div class="rules-panel">
-          <div v-if="canManageInfrastructure" class="bento-card form-card">
-            <div class="card-title-bar">
-              <span class="card-title">{{ editingRuleId ? '编辑规则' : '新增规则' }}</span>
-              <n-button v-if="editingRuleId" size="small" text style="color: #a1a1aa" @click="resetRuleForm">取消编辑</n-button>
-            </div>
-
-            <div class="rule-grid">
-              <div class="field-block">
-                <span>监控指标</span>
-                <n-select v-model:value="ruleForm.metric" :options="metricOptions" class="dark-input" />
-              </div>
-              <div class="field-block">
-                <span>触发条件</span>
-                <n-select v-model:value="ruleForm.operator" :options="operatorOptions" class="dark-input" />
-              </div>
-              <div class="field-block">
-                <span>危险阈值</span>
-                <n-input-number v-model:value="ruleForm.threshold" style="width: 100%" class="dark-input" />
-              </div>
-              <div class="field-block">
-                <span>持续时间(秒)</span>
-                <n-input-number v-model:value="ruleForm.durationSeconds" :min="0" style="width: 100%" class="dark-input" />
-              </div>
-              <div class="field-block field-block--switch">
-                <span>状态</span>
-                <n-switch v-model:value="ruleForm.enabled" />
-              </div>
-            </div>
-            <div class="rule-actions">
-              <n-button type="primary" class="glow-btn" :loading="savingRule" @click="handleSubmitRule" style="width: 100%">
-                {{ editingRuleId ? '保存规则更改' : '+ 添加监控规则' }}
-              </n-button>
-            </div>
+        <aside ref="notificationPanel" class="alert-side" :class="{ highlighted: notificationHighlighted }">
+          <div v-if="!canManageInfrastructure" class="empty-state compact">
+            当前账号没有修改通知设置的权限。
           </div>
-
-          <div v-if="canManageInfrastructure" class="bento-card form-card">
-            <div class="card-title-bar">
-              <span class="card-title">通知通道</span>
+          <div v-else class="side-section">
+            <div class="side-title">
+              <strong>告警通知</strong>
               <n-tag size="small" :type="notificationSettings.enabled ? 'success' : 'default'" bordered>
-                {{ notificationSettings.enabled ? '已启用' : '已关闭' }}
+                {{ notificationSettings.enabled ? '启用' : '关闭' }}
               </n-tag>
             </div>
-
-            <div class="rule-grid">
-              <div class="field-block field-block--switch">
-                <span>Webhook 通知</span>
-                <n-switch v-model:value="notificationSettings.enabled" :disabled="!canManageInfrastructure" />
+            <div class="rule-grid single">
+              <div class="field-block switch-row">
+                <span>启用通知</span>
+                <n-switch v-model:value="notificationSettings.enabled" />
               </div>
-              <div class="field-block" style="grid-column: span 2">
-                <span>Webhook 地址</span>
+              <div class="field-block">
+                <span>通知地址</span>
                 <n-input
                   v-model:value="notificationSettings.webhookURL"
                   placeholder="https://hooks.example.com/alerts"
-                  :disabled="!canManageInfrastructure || notificationSettings.clearWebhookURL"
+                  :disabled="notificationSettings.clearWebhookURL"
+                  class="dark-input"
                 />
-                <small v-if="notificationSettings.webhookConfigured && !notificationSettings.webhookURL && !notificationSettings.clearWebhookURL" class="field-hint">
-                  已保存地址，当前为安全起见不回显明文。
-                </small>
               </div>
-              <div class="field-block field-block--switch">
+              <div class="field-block switch-row">
                 <span>清空已保存地址</span>
-                <n-switch v-model:value="notificationSettings.clearWebhookURL" :disabled="!canManageInfrastructure" />
+                <n-switch v-model:value="notificationSettings.clearWebhookURL" />
               </div>
               <div class="field-block">
-                <span>超时(秒)</span>
-                <n-input-number
-                  v-model:value="notificationSettings.webhookTimeoutSeconds"
-                  :min="1"
-                  style="width: 100%"
-                  class="dark-input"
-                  :disabled="!canManageInfrastructure"
-                />
+                <span>超时秒数</span>
+                <n-input-number v-model:value="notificationSettings.webhookTimeoutSeconds" :min="1" style="width: 100%" class="dark-input" />
               </div>
             </div>
-            <p class="notification-hint">静默中的告警和维护窗口内的告警不会发送通知。</p>
-            <div v-if="canManageInfrastructure" class="rule-actions">
-              <n-button
-                type="primary"
-                class="glow-btn"
-                :loading="savingNotificationSettings"
-                @click="handleSubmitNotificationSettings"
-                style="width: 100%"
-              >
-                保存通知设置
-              </n-button>
+            <div class="notification-actions">
+              <n-button type="primary" :loading="savingNotificationSettings" @click="handleSubmitNotificationSettings">保存</n-button>
+              <n-button ghost :loading="testingNotification" @click="handleTestNotification">测试</n-button>
             </div>
+            <n-button text class="rules-link" @click="openRulePage">进入规则管理</n-button>
           </div>
-
-          <div class="bento-card rules-list-card">
-            <div class="card-title-bar">
-              <span class="card-title">规则列表 ({{ rules.length }})</span>
-            </div>
-
-            <div v-if="rules.length === 0" class="empty-state">
-              暂未配置任何监控规则。
-            </div>
-
-            <div class="rules-list">
-              <div v-for="rule in rules" :key="rule.id" class="rule-item">
-                <div class="rule-info">
-                  <div class="rule-condition">
-                    <n-tag size="small" type="info" bordered class="metric-tag">{{ metricLabel(rule.metric) }}</n-tag>
-                    <span class="operator">{{ operatorLabel(rule.operator) }}</span>
-                    <strong class="threshold">{{ rule.threshold }}</strong>
-                    <span class="duration">(持续 {{ rule.durationSeconds }}s)</span>
-                  </div>
-                  <div class="rule-status">
-                    <div class="status-dot-inline" :style="{ background: rule.enabled ? '#10b981' : '#71717a' }"></div>
-                    {{ rule.enabled ? '运行中' : '已停用' }}
-                  </div>
-                </div>
-                <div class="rule-btn" v-if="canManageInfrastructure">
-                  <n-button size="small" ghost @click="startEditRule(rule)">修改</n-button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
+        </aside>
       </div>
     </div>
   </n-scrollbar>
@@ -518,354 +587,610 @@ onMounted(() => {
   flex: 1;
 }
 
-.page-container {
-  padding: 32px;
-  max-width: 1600px;
-  margin: 0 auto;
-}
-
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  margin-bottom: 32px;
-}
-
-.header-text h1 {
-  font-size: 32px;
-  font-weight: 600;
-  margin: 0 0 8px 0;
-  color: #fff;
-  letter-spacing: -0.5px;
-}
-
-.header-text p {
+.alert-page {
+  max-width: 100%;
   margin: 0;
-  color: #a1a1aa;
-  font-size: 16px;
 }
 
-.header-actions {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-}
-
-.layout-grid {
+.alert-summary-strip {
+  min-height: 86px;
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(420px, 1fr);
-  gap: 24px;
-}
-
-.bento-card {
-  background: rgba(20, 20, 25, 0.6);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 20px;
-  padding: 24px;
-  position: relative;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-bottom: 14px;
   overflow: hidden;
+  border: 1px solid rgba(93, 120, 162, 0.22);
+  border-radius: 8px;
+  background: var(--app-panel);
 }
 
-.card-title-bar {
-  display: flex;
-  justify-content: space-between;
+.summary-cell {
+  position: relative;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-content: center;
   align-items: center;
-  margin-bottom: 20px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  gap: 5px;
+  min-width: 0;
+  padding: 14px 18px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 0.16s ease, box-shadow 0.16s ease, color 0.16s ease;
 }
 
-.card-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: #fff;
+.summary-cell + .summary-cell {
+  border-left: 1px solid rgba(93, 120, 162, 0.16);
 }
 
-.alerts-panel {
-  display: flex;
-  flex-direction: column;
+.summary-cell:hover {
+  background: rgba(79, 131, 255, 0.08);
 }
 
-.timeline-container {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  margin-top: 8px;
+.summary-cell:focus-visible {
+  outline: 2px solid rgba(79, 131, 255, 0.72);
+  outline-offset: -2px;
 }
 
-.alert-card {
-  display: flex;
-  gap: 16px;
+.summary-cell.active {
+  background: rgba(79, 131, 255, 0.12);
+  box-shadow: inset 0 3px 0 currentColor;
 }
 
-.alert-icon {
-  width: 46px;
-  height: 46px;
-  border-radius: 50%;
-  background: #18181b;
-  border: 2px solid #3f3f46;
-  display: flex;
+.summary-mark {
+  grid-row: span 3;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid currentColor;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
-  font-weight: 700;
+  opacity: 0.86;
+}
+
+.summary-mark svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.summary-cell span,
+.summary-cell small {
+  color: var(--app-text-soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.summary-cell strong {
+  color: var(--app-text);
+  font-size: 22px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.summary-cell.danger {
+  color: var(--app-danger);
+}
+
+.summary-cell.danger strong {
+  color: var(--app-danger);
+}
+
+.summary-cell.warning {
+  color: var(--app-warning);
+}
+
+.summary-cell.warning strong {
+  color: var(--app-warning);
+}
+
+.summary-cell.info {
+  color: var(--app-accent);
+}
+
+.summary-cell.info strong {
+  color: var(--app-accent);
+}
+
+.summary-cell.success {
+  color: #35d6a3;
+}
+
+.summary-cell.success strong {
+  color: #35d6a3;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  display: inline-block;
+  border-radius: 50%;
+  background: var(--app-danger);
+}
+
+.status-dot.online {
+  background: #35d6a3;
+  box-shadow: 0 0 10px rgba(53, 214, 163, 0.58);
+}
+
+.alert-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
+  gap: 14px;
+  align-items: start;
+}
+
+.alert-board,
+.alert-side {
+  border: 1px solid rgba(93, 120, 162, 0.22);
+  background: var(--app-panel);
+  border-radius: 8px;
+}
+
+.alert-board {
+  min-width: 0;
+  min-height: calc(100vh - 224px);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+}
+
+.alert-side {
+  position: sticky;
+  top: 78px;
+  padding: 14px;
+  max-height: calc(100vh - 180px);
+  overflow: auto;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.alert-side.highlighted {
+  border-color: rgba(53, 214, 163, 0.46) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 0 0 2px rgba(53, 214, 163, 0.12) !important;
+}
+
+.board-head,
+.side-title,
+.alert-header,
+.alert-footer,
+.rule-item,
+.notification-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.board-head {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(93, 120, 162, 0.16);
+}
+
+.board-head strong,
+.side-title strong {
+  display: block;
+  color: var(--app-text);
+  font-size: 15px;
+}
+
+.board-head span {
+  display: block;
+  margin-top: 3px;
+  color: var(--app-text-soft);
+  font-size: 12px;
+}
+
+.alert-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.alert-tabs :deep(.n-tabs-nav) {
   flex-shrink: 0;
 }
 
+.alert-tabs :deep(.n-tab-pane),
+.alert-tabs :deep(.n-tabs-pane-wrapper),
+.alert-tabs :deep(.n-tabs-pane-wrapper .n-tabs-pane-wrapper) {
+  min-height: 0;
+}
+
+.alert-tabs :deep(.n-tabs-pane-wrapper) {
+  flex: 1;
+}
+
+.alert-pane {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.alert-list-region {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.alert-table-wrap {
+  margin-top: 10px;
+  overflow: auto;
+  border: 1px solid rgba(93, 120, 162, 0.16);
+  border-radius: 8px;
+}
+
+.alert-table {
+  width: 100%;
+  min-width: 670px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.alert-table th,
+.alert-table td {
+  padding: 10px 10px;
+  border-bottom: 1px solid rgba(93, 120, 162, 0.12);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.alert-table th {
+  color: var(--app-text-soft);
+  background: rgba(17, 32, 52, 0.52);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.alert-table td {
+  color: #dce7f6;
+  font-size: 12px;
+}
+
+.alert-table tbody tr:hover td {
+  background: rgba(79, 131, 255, 0.07);
+}
+
+.alert-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.alert-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.alert-name-cell strong,
+.table-strong {
+  display: block;
+  color: var(--app-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alert-name-cell small,
+.block-muted {
+  display: block;
+  margin-top: 3px;
+  color: var(--app-text-faint);
+  font-size: 12px;
+}
+
+.severity-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--app-warning);
+  box-shadow: 0 0 12px rgba(232, 180, 95, 0.5);
+}
+
+.severity-dot.critical {
+  background: var(--app-danger);
+  box-shadow: 0 0 12px rgba(255, 107, 125, 0.55);
+}
+
+.danger-cell {
+  color: var(--app-danger) !important;
+  font-weight: 700;
+}
+
+.warning-cell {
+  color: var(--app-warning) !important;
+  font-weight: 700;
+}
+
+.muted-cell {
+  color: var(--app-text-soft) !important;
+}
+
+.table-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.table-actions :deep(.n-button) {
+  min-width: 38px;
+  padding-inline: 8px !important;
+}
+
+.alert-pager-slot {
+  flex-shrink: 0;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(93, 120, 162, 0.14);
+  background: rgba(8, 18, 32, 0.86);
+}
+
+.alert-card {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.alert-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(93, 120, 162, 0.22);
+  color: var(--app-text-soft);
+  font-weight: 800;
+}
+
 .alert-icon.critical {
-  border-color: #f43f5e;
-  color: #f43f5e;
-  box-shadow: 0 0 15px rgba(244, 63, 94, 0.2);
+  color: var(--app-danger);
+  background: rgba(255, 107, 125, 0.1);
+  border-color: rgba(255, 107, 125, 0.28);
 }
 
 .alert-icon.warning {
-  border-color: #f59e0b;
-  color: #f59e0b;
-  box-shadow: 0 0 15px rgba(245, 158, 11, 0.2);
+  color: var(--app-warning);
+  background: rgba(232, 180, 95, 0.1);
+  border-color: rgba(232, 180, 95, 0.28);
 }
 
-.history-icon {
-  border-color: #3b82f6;
-  color: #3b82f6;
-  box-shadow: 0 0 15px rgba(59, 130, 246, 0.2);
+.alert-icon.resolved {
+  color: #35d6a3;
+  background: rgba(53, 214, 163, 0.1);
+  border-color: rgba(53, 214, 163, 0.28);
 }
 
 .alert-content {
-  flex: 1;
-  background: rgba(0, 0, 0, 0.2);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 16px;
-  padding: 18px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(93, 120, 162, 0.16);
+  background: rgba(17, 32, 52, 0.46);
+  border-radius: 8px;
 }
 
 .history-card .alert-content {
-  opacity: 0.92;
-}
-
-.alert-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 8px;
+  background: rgba(12, 24, 42, 0.4);
 }
 
 .alert-server {
-  font-weight: 600;
-  color: #fff;
-  font-size: 15px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--app-text);
+  font: inherit;
+  font-weight: 700;
+  text-align: left;
   cursor: pointer;
 }
 
 .alert-server:hover {
-  color: #10b981;
+  color: var(--app-accent);
 }
 
-.alert-time {
-  font-size: 13px;
-  color: #71717a;
+.alert-time,
+.alert-meta,
+.rule-meta {
+  color: var(--app-text-soft);
+  font-size: 12px;
 }
 
 .alert-message {
-  color: #d4d4d8;
+  margin: 8px 0 10px;
+  color: #dce7f6;
   font-size: 14px;
-  line-height: 1.6;
-  margin-bottom: 14px;
+  line-height: 1.55;
 }
 
 .alert-meta {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
-  margin-bottom: 14px;
-}
-
-.meta-text {
-  color: #a1a1aa;
-  font-size: 12px;
 }
 
 .alert-footer {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: center;
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
-  padding-top: 14px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(93, 120, 162, 0.12);
 }
 
-.inline-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  align-items: center;
+.pager {
+  justify-content: flex-end;
 }
 
-:deep(.mute-select) {
-  width: 110px;
+.side-section {
+  display: grid;
+  gap: 14px;
+  padding-top: 6px;
 }
 
-.rules-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 24px;
+.rules-list-section {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(93, 120, 162, 0.14);
 }
 
 .rule-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 16px;
-}
-
-.field-block {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.field-block span {
-  color: #d4d4d8;
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.field-block--switch {
-  grid-column: span 2;
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 8px;
-}
-
-.rule-actions {
-  margin-top: 24px;
-}
-
-.notification-hint {
-  margin: 16px 0 0;
-  color: #a1a1aa;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.glow-btn {
-  box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
-  transition: all 0.3s ease;
-  background-color: #10b981 !important;
-  color: #fff !important;
-  border: none;
-}
-
-.glow-btn:hover {
-  box-shadow: 0 0 30px rgba(16, 185, 129, 0.6);
-  transform: translateY(-1px);
-}
-
-:deep(.dark-input .n-input__border),
-:deep(.dark-input .n-base-selection__border) {
-  border-color: rgba(255, 255, 255, 0.1);
-}
-
-:deep(.dark-input .n-input__placeholder),
-:deep(.dark-input .n-base-selection-placeholder) {
-  color: #71717a;
-}
-
-.rules-list {
-  display: flex;
-  flex-direction: column;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
-.rule-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-  padding: 16px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 12px;
+.rule-grid.single {
+  grid-template-columns: 1fr;
 }
 
-.rule-info {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.field-block {
+  display: grid;
+  gap: 6px;
+}
+
+.field-block span {
+  color: var(--app-text-soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.switch-row {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+.save-button {
+  width: 100%;
+}
+
+.rules-list {
+  display: grid;
+  gap: 10px;
+}
+
+.rule-item {
+  padding: 12px;
+  border: 1px solid rgba(93, 120, 162, 0.16);
+  border-radius: 8px;
+  background: rgba(17, 32, 52, 0.42);
 }
 
 .rule-condition {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  color: #dce7f6;
 }
 
-.metric-tag {
-  background: transparent;
-  color: #3b82f6;
-  border-color: rgba(59, 130, 246, 0.3);
+.rule-condition strong {
+  color: var(--app-text);
 }
 
-.operator {
-  color: #a1a1aa;
-  font-size: 13px;
+.rule-meta {
+  margin-top: 6px;
 }
 
-.threshold {
-  color: #fff;
-  font-size: 16px;
+.notification-actions {
+  justify-content: flex-start;
 }
 
-.duration {
-  color: #71717a;
-  font-size: 13px;
-}
-
-.rule-status {
-  display: flex;
-  align-items: center;
-  font-size: 12px;
-  color: #a1a1aa;
-}
-
-.status-dot-inline {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  margin-right: 6px;
+.rules-link {
+  width: max-content;
+  justify-self: start;
+  padding-inline: 0 !important;
+  color: var(--app-accent) !important;
 }
 
 .empty-state {
-  color: #71717a;
-  padding: 32px 0;
+  padding: 38px 0;
+  color: var(--app-text-faint);
   text-align: center;
 }
 
-@media (max-width: 1024px) {
-  .layout-grid {
+.empty-state.compact {
+  padding: 18px 0;
+}
+
+:deep(.dark-input .n-input-wrapper),
+:deep(.dark-input .n-base-selection),
+:deep(.dark-input .n-input-number) {
+  border-radius: 8px !important;
+  background: rgba(9, 20, 36, 0.88) !important;
+  background-color: rgba(9, 20, 36, 0.88) !important;
+  border: 1px solid rgba(93, 120, 162, 0.24) !important;
+}
+
+:deep(.dark-input .n-input__border),
+:deep(.dark-input .n-input__state-border),
+:deep(.dark-input .n-base-selection__border),
+:deep(.dark-input .n-base-selection__state-border) {
+  display: none !important;
+}
+
+@media (max-width: 1120px) {
+  .alert-summary-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .summary-cell + .summary-cell {
+    border-left: 0;
+    border-top: 1px solid rgba(93, 120, 162, 0.12);
+  }
+
+  .alert-workspace {
     grid-template-columns: 1fr;
+  }
+
+  .alert-board {
+    height: auto;
+    min-height: 0;
+  }
+
+  .alert-list-region {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .alert-side {
+    position: static;
+    max-height: none;
   }
 }
 
 @media (max-width: 640px) {
-  .page-header {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 16px;
+  .alert-summary-strip {
+    grid-template-columns: 1fr;
   }
 
-  .alert-header,
-  .alert-footer {
-    flex-direction: column;
-    align-items: flex-start;
+  .alert-card {
+    grid-template-columns: 1fr;
+  }
+
+  .alert-icon {
+    display: none;
   }
 
   .rule-grid {
     grid-template-columns: 1fr;
   }
 
-  .field-block--switch {
-    grid-column: span 1;
+  .alert-header,
+  .alert-footer {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 </style>

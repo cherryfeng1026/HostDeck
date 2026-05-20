@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,15 +18,23 @@ import (
 )
 
 var (
-	ErrAlertNotFound                  = errors.New("告警不存在")
-	ErrAlertActionNotAllowed          = errors.New("当前告警状态不支持该操作")
-	ErrInvalidAlertNotificationSettings = errors.New("告警通知设置无效")
+	ErrAlertNotFound                        = errors.New("告警不存在")
+	ErrAlertRuleNotFound                    = errors.New("告警规则不存在")
+	ErrAlertActionNotAllowed                = errors.New("当前告警状态不支持该操作")
+	ErrInvalidAlertNotificationSettings     = errors.New("告警通知设置无效")
+	ErrInvalidAlertRule                     = errors.New("告警规则无效")
+	ErrInvalidAlertRuleScope                = errors.New("告警规则作用范围无效")
+	ErrInvalidNotificationDeliveryStatus    = errors.New("通知投递状态无效")
+	ErrAlertNotificationDeliveryUnavailable = errors.New("告警通知投递记录不可用")
 )
+
+const maxAlertRuleDurationSeconds = 24 * 60 * 60
 
 type AlertRuleStore interface {
 	List(ctx context.Context) ([]domain.AlertRule, error)
 	Create(ctx context.Context, rule domain.AlertRule) error
 	Update(ctx context.Context, rule domain.AlertRule) error
+	Delete(ctx context.Context, id int64) error
 }
 
 type AlertStateStore interface {
@@ -53,12 +63,17 @@ type AlertNotificationSettingsStore interface {
 	SaveNotificationSettings(ctx context.Context, settings domain.AlertNotificationSettings) (domain.AlertNotificationSettings, error)
 }
 
+type AlertNotificationDeliveryReader interface {
+	ListNotificationDeliveries(ctx context.Context, filter domain.AlertNotificationDeliveryFilter) ([]domain.AlertNotificationDelivery, error)
+}
+
 type AlertService struct {
-	rules    AlertRuleStore
-	states   AlertStateStore
-	servers  AlertServerStore
-	settings AlertNotificationSettingsStore
-	notifier AlertNotifier
+	rules      AlertRuleStore
+	states     AlertStateStore
+	servers    AlertServerStore
+	settings   AlertNotificationSettingsStore
+	deliveries AlertNotificationDeliveryReader
+	notifier   AlertNotifier
 }
 
 func NewAlertService(rules AlertRuleStore, states AlertStateStore, servers AlertServerStore, settings AlertNotificationSettingsStore, notifiers ...AlertNotifier) *AlertService {
@@ -67,6 +82,9 @@ func NewAlertService(rules AlertRuleStore, states AlertStateStore, servers Alert
 		states:   states,
 		servers:  servers,
 		settings: settings,
+	}
+	if deliveries, ok := settings.(AlertNotificationDeliveryReader); ok {
+		service.deliveries = deliveries
 	}
 	if len(notifiers) > 0 {
 		service.notifier = notifiers[0]
@@ -109,12 +127,40 @@ func (s *AlertService) ListRules(ctx context.Context) ([]domain.AlertRule, error
 
 func (s *AlertService) CreateRule(ctx context.Context, rule domain.AlertRule) error {
 	normalizeRule(&rule)
+	if err := validateAlertRule(rule); err != nil {
+		return err
+	}
+	if err := validateAlertRuleScope(rule); err != nil {
+		return err
+	}
 	return s.rules.Create(ctx, rule)
 }
 
 func (s *AlertService) UpdateRule(ctx context.Context, rule domain.AlertRule) error {
 	normalizeRule(&rule)
-	return s.rules.Update(ctx, rule)
+	if err := validateAlertRule(rule); err != nil {
+		return err
+	}
+	if err := validateAlertRuleScope(rule); err != nil {
+		return err
+	}
+	if err := s.rules.Update(ctx, rule); err != nil {
+		if errors.Is(err, storage.ErrAlertRuleNotFound) {
+			return ErrAlertRuleNotFound
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *AlertService) DeleteRule(ctx context.Context, id int64) error {
+	if err := s.rules.Delete(ctx, id); err != nil {
+		if errors.Is(err, storage.ErrAlertRuleNotFound) {
+			return ErrAlertRuleNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *AlertService) GetNotificationSettings(ctx context.Context) (domain.AlertNotificationSettings, error) {
@@ -160,7 +206,13 @@ func (s *AlertService) EvaluateServerSnapshot(ctx context.Context, server domain
 	if err != nil {
 		return err
 	}
-	current := EvaluateAlerts(rules, snapshot, sampledAt)
+	scopedRules := make([]domain.AlertRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Enabled && alertRuleMatchesServer(rule, server) {
+			scopedRules = append(scopedRules, rule)
+		}
+	}
+	current := EvaluateAlerts(scopedRules, snapshot, sampledAt)
 	activeByRule := make(map[int64]domain.AlertEvent, len(current))
 	for _, event := range current {
 		activeByRule[event.RuleID] = event
@@ -181,6 +233,15 @@ func (s *AlertService) EvaluateServerSnapshot(ctx context.Context, server domain
 		event, matched := activeByRule[rule.ID]
 		state, hasState := stateByRule[rule.ID]
 		if server.InMaintenanceWindow(sampledAt) {
+			continue
+		}
+		if !rule.Enabled || !alertRuleMatchesServer(rule, server) {
+			if hasState {
+				if _, err := s.states.ResolveByRuleAndServer(ctx, rule.ID, server.ID, "rule disabled or scope changed"); err != nil {
+					return err
+				}
+				s.notifyResolved(ctx, server, state, sampledAt)
+			}
 			continue
 		}
 		if matched {
@@ -205,7 +266,11 @@ func (s *AlertService) EvaluateServerSnapshot(ctx context.Context, server domain
 					status = domain.AlertStatusAcknowledged
 				}
 			}
-			nextState, _, err := s.states.UpsertEvaluation(ctx, storage.AlertEvaluationRecord{
+			shouldNotify := status == domain.AlertStatusActive && (!hasState || state.Status == domain.AlertStatusPending)
+			var preparedNotification AlertNotification
+			var preparedDelivery domain.AlertNotificationDelivery
+			transactionalNotifier, hasTransactionalNotifier := s.notifier.(TransactionalAlertNotifier)
+			record := storage.AlertEvaluationRecord{
 				RuleID:          rule.ID,
 				ServerID:        server.ID,
 				Metric:          event.Metric,
@@ -221,11 +286,35 @@ func (s *AlertService) EvaluateServerSnapshot(ctx context.Context, server domain
 				AcknowledgedAt:  acknowledgedAt,
 				AcknowledgedBy:  acknowledgedBy,
 				MutedUntil:      mutedUntil,
-			})
+			}
+			if shouldNotify && hasTransactionalNotifier {
+				record.NotificationDeliveryBuilder = func(nextState domain.AlertState) (domain.AlertNotificationDelivery, string, bool, error) {
+					preparedNotification = AlertNotification{
+						EventType:  domain.AlertEventTriggered,
+						Alert:      s.alertEventFromState(server.Name, nextState),
+						OccurredAt: sampledAt.UTC(),
+					}
+					delivery, payload, ok, err := transactionalNotifier.PrepareDelivery(ctx, preparedNotification)
+					if err != nil || !ok {
+						return domain.AlertNotificationDelivery{}, "", false, err
+					}
+					return delivery, payload, true, nil
+				}
+				record.NotificationDeliveryCreated = func(delivery domain.AlertNotificationDelivery) {
+					preparedDelivery = delivery
+				}
+			}
+			nextState, _, err := s.states.UpsertEvaluation(ctx, record)
 			if err != nil {
 				return err
 			}
-			s.notifyTriggered(ctx, server, state, hasState, nextState, sampledAt)
+			if preparedDelivery.ID != 0 {
+				if err := transactionalNotifier.DeliverPrepared(ctx, preparedDelivery, preparedNotification); err != nil {
+					slog.Warn("notify triggered alert failed", "error", err, "ruleId", nextState.RuleID, "serverId", nextState.ServerID)
+				}
+			} else {
+				s.notifyTriggered(ctx, server, state, hasState, nextState, sampledAt)
+			}
 			continue
 		}
 
@@ -236,6 +325,26 @@ func (s *AlertService) EvaluateServerSnapshot(ctx context.Context, server domain
 			return err
 		}
 		s.notifyResolved(ctx, server, state, sampledAt)
+	}
+	return nil
+}
+
+func (s *AlertService) ResolveServerAlerts(ctx context.Context, server domain.Server, detail string, occurredAt time.Time) error {
+	if s.states == nil {
+		return nil
+	}
+	states, err := s.states.ListCurrentStates(ctx)
+	if err != nil {
+		return err
+	}
+	for _, state := range states {
+		if state.ServerID != server.ID {
+			continue
+		}
+		if _, err := s.states.ResolveByRuleAndServer(ctx, state.RuleID, server.ID, detail); err != nil {
+			return err
+		}
+		s.notifyResolved(ctx, server, state, occurredAt)
 	}
 	return nil
 }
@@ -315,7 +424,7 @@ func (s *AlertService) ListCurrentAlerts(ctx context.Context) ([]domain.AlertEve
 	}
 	items := make([]domain.AlertEvent, 0, len(states))
 	for _, state := range states {
-		if state.Status == domain.AlertStatusPending {
+		if !isCurrentAlertStatus(state.Status) {
 			continue
 		}
 		server := serverByID[state.ServerID]
@@ -347,6 +456,51 @@ func (s *AlertService) ListCurrentAlerts(ctx context.Context) ([]domain.AlertEve
 
 func (s *AlertService) ListAlertHistory(ctx context.Context, limit int) ([]domain.AlertHistoryEvent, error) {
 	return s.states.ListHistory(ctx, limit)
+}
+
+func (s *AlertService) ListNotificationDeliveries(ctx context.Context, status string, limit int) ([]domain.AlertNotificationDelivery, error) {
+	if s.deliveries == nil {
+		return nil, ErrAlertNotificationDeliveryUnavailable
+	}
+	status = strings.TrimSpace(status)
+	if status != "" && !isValidNotificationDeliveryStatus(status) {
+		return nil, ErrInvalidNotificationDeliveryStatus
+	}
+	return s.deliveries.ListNotificationDeliveries(ctx, domain.AlertNotificationDeliveryFilter{
+		Status: status,
+		Limit:  limit,
+	})
+}
+
+func (s *AlertService) RetryNotificationDeliveries(ctx context.Context, limit int) (int, error) {
+	retrier, ok := s.notifier.(interface {
+		RetryPending(ctx context.Context, limit int) (int, error)
+	})
+	if !ok {
+		return 0, ErrAlertNotificationDeliveryUnavailable
+	}
+	return retrier.RetryPending(ctx, limit)
+}
+
+func (s *AlertService) SendTestNotification(ctx context.Context, username string) error {
+	if s.notifier == nil {
+		return ErrAlertNotificationDeliveryUnavailable
+	}
+	now := time.Now().UTC()
+	return s.notifier.NotifyAlert(ctx, AlertNotification{
+		EventType: domain.AlertEventTest,
+		Alert: domain.AlertEvent{
+			ServerName:      "HostDeck",
+			Metric:          "notification_test",
+			Operator:        "test",
+			Severity:        "info",
+			Message:         "HostDeck 告警通知测试" + formatTestNotificationActor(username),
+			Status:          domain.AlertEventTest,
+			TriggeredAt:     now,
+			LastTriggeredAt: now,
+		},
+		OccurredAt: now,
+	})
 }
 
 func (s *AlertService) ListAlertHistoryByTypes(ctx context.Context, limit int, eventTypes ...string) ([]domain.AlertHistoryEvent, error) {
@@ -439,6 +593,125 @@ func (s *AlertService) stateToEvent(ctx context.Context, state domain.AlertState
 func normalizeRule(rule *domain.AlertRule) {
 	rule.Metric = strings.TrimSpace(rule.Metric)
 	rule.Operator = strings.TrimSpace(rule.Operator)
+	rule.ScopeType = strings.TrimSpace(rule.ScopeType)
+	rule.ScopeValue = strings.TrimSpace(rule.ScopeValue)
+	if rule.ScopeType == "" {
+		rule.ScopeType = domain.AlertRuleScopeAll
+	}
+	if rule.ScopeType == domain.AlertRuleScopeAll {
+		rule.ScopeValue = ""
+	}
+}
+
+func validateAlertRule(rule domain.AlertRule) error {
+	if !isValidAlertMetric(rule.Metric) {
+		return fmt.Errorf("%w: metric must be one of online, cpu_usage, memory_usage, disk_usage", ErrInvalidAlertRule)
+	}
+	if !isValidAlertOperator(rule.Operator) {
+		return fmt.Errorf("%w: operator must be one of eq, gt, gte, lt, lte", ErrInvalidAlertRule)
+	}
+	if math.IsNaN(rule.Threshold) || math.IsInf(rule.Threshold, 0) {
+		return fmt.Errorf("%w: threshold must be finite", ErrInvalidAlertRule)
+	}
+	if rule.DurationSeconds < 0 || rule.DurationSeconds > maxAlertRuleDurationSeconds {
+		return fmt.Errorf("%w: durationSeconds must be between 0 and %d", ErrInvalidAlertRule, maxAlertRuleDurationSeconds)
+	}
+	if rule.Metric == "online" {
+		if rule.Threshold != 0 && rule.Threshold != 1 {
+			return fmt.Errorf("%w: online threshold must be 0 or 1", ErrInvalidAlertRule)
+		}
+		return nil
+	}
+	if rule.Threshold < 0 || rule.Threshold > 100 {
+		return fmt.Errorf("%w: percentage threshold must be between 0 and 100", ErrInvalidAlertRule)
+	}
+	return nil
+}
+
+func validateAlertRuleScope(rule domain.AlertRule) error {
+	switch rule.ScopeType {
+	case domain.AlertRuleScopeAll:
+		return nil
+	case domain.AlertRuleScopeServer:
+		serverID, err := strconv.ParseInt(rule.ScopeValue, 10, 64)
+		if err != nil || serverID <= 0 {
+			return fmt.Errorf("%w: server scope requires a positive server id", ErrInvalidAlertRuleScope)
+		}
+		return nil
+	case domain.AlertRuleScopeTag, domain.AlertRuleScopePurpose:
+		if strings.TrimSpace(rule.ScopeValue) == "" {
+			return fmt.Errorf("%w: %s scope requires a value", ErrInvalidAlertRuleScope, rule.ScopeType)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %s", ErrInvalidAlertRuleScope, rule.ScopeType)
+	}
+}
+
+func isValidAlertMetric(metric string) bool {
+	switch metric {
+	case "online", "cpu_usage", "memory_usage", "disk_usage":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidAlertOperator(operator string) bool {
+	switch operator {
+	case "eq", "gt", "gte", "lt", "lte":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCurrentAlertStatus(status string) bool {
+	switch status {
+	case domain.AlertStatusActive, domain.AlertStatusAcknowledged, domain.AlertStatusMuted:
+		return true
+	default:
+		return false
+	}
+}
+
+func alertRuleMatchesServer(rule domain.AlertRule, server domain.Server) bool {
+	switch strings.TrimSpace(rule.ScopeType) {
+	case "", domain.AlertRuleScopeAll:
+		return true
+	case domain.AlertRuleScopeServer:
+		serverID, err := strconv.ParseInt(strings.TrimSpace(rule.ScopeValue), 10, 64)
+		return err == nil && serverID == server.ID
+	case domain.AlertRuleScopeTag:
+		expected := strings.TrimSpace(rule.ScopeValue)
+		for _, tag := range server.Tags {
+			if strings.EqualFold(strings.TrimSpace(tag), expected) {
+				return true
+			}
+		}
+		return false
+	case domain.AlertRuleScopePurpose:
+		return strings.EqualFold(strings.TrimSpace(server.Purpose), strings.TrimSpace(rule.ScopeValue))
+	default:
+		return false
+	}
+}
+
+func isValidNotificationDeliveryStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "", domain.AlertNotificationDeliveryPending, domain.AlertNotificationDeliverySent, domain.AlertNotificationDeliveryFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func formatTestNotificationActor(username string) string {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return ""
+	}
+	return "，操作者：" + username
 }
 
 func metricValue(metric string, snapshot collector.Snapshot) float64 {

@@ -2,12 +2,53 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/sshx"
 )
+
+const (
+	collectSectionCPU       = "cpu"
+	collectSectionMemInfo   = "meminfo"
+	collectSectionDisk      = "disk"
+	collectSectionLoad      = "loadavg"
+	collectSectionOSRelease = "osrelease"
+	collectSectionKernel    = "kernel"
+	collectSectionUptime    = "uptime"
+)
+
+const batchCollectCommand = `sh -c '
+set -eu
+section() { printf "__HOSTDECK__:%s\n" "$1"; }
+section cpu
+cat /proc/stat
+sleep 1
+cat /proc/stat
+section meminfo
+cat /proc/meminfo
+section disk
+df -P /
+section loadavg
+cat /proc/loadavg
+section osrelease
+cat /etc/os-release
+section kernel
+uname -r
+section uptime
+cat /proc/uptime
+'`
+
+type collectCommandFailedError struct {
+	message string
+}
+
+func (e collectCommandFailedError) Error() string {
+	return e.message
+}
 
 type SSHCollector struct {
 	runner sshx.Runner
@@ -23,72 +64,62 @@ func (c *SSHCollector) Collect(ctx context.Context, server domain.Server) (Snaps
 		Port:                      server.SSHPort,
 		Username:                  server.Username,
 		Password:                  server.Password,
+		PrivateKeyPEM:             server.PrivateKey,
 		TrustedHostKeyFingerprint: server.TrustedHostKeyFingerprint,
 	}
 
-	cpuRaw, err := c.runCommand(ctx, target, "sh -c 'cat /proc/stat; sleep 1; cat /proc/stat'")
+	startedAt := time.Now()
+	raw, err := c.runCommand(ctx, target, batchCollectCommand)
 	if err != nil {
+		if isHostKeyTrustError(err) {
+			return Snapshot{}, err
+		}
+		var commandFailedErr collectCommandFailedError
+		if errors.As(err, &commandFailedErr) {
+			return Snapshot{}, err
+		}
 		return Snapshot{Online: false, SSHOK: false, Source: "ssh"}, nil
-	}
-	memRaw, err := c.runCommand(ctx, target, "cat /proc/meminfo")
-	if err != nil {
-		return Snapshot{Online: false, SSHOK: false, Source: "ssh"}, nil
-	}
-	diskRaw, err := c.runCommand(ctx, target, "df -P /")
-	if err != nil {
-		return Snapshot{}, err
-	}
-	loadRaw, err := c.runCommand(ctx, target, "cat /proc/loadavg")
-	if err != nil {
-		return Snapshot{}, err
-	}
-	osReleaseRaw, err := c.runCommand(ctx, target, "cat /etc/os-release")
-	if err != nil {
-		return Snapshot{}, err
-	}
-	kernelRaw, err := c.runCommand(ctx, target, "uname -r")
-	if err != nil {
-		return Snapshot{}, err
-	}
-	uptimeRaw, err := c.runCommand(ctx, target, "cat /proc/uptime")
-	if err != nil {
-		return Snapshot{}, err
 	}
 
-	cpuUsage, err := parseCPUUsage(cpuRaw)
+	sections, err := parseBatchCollectOutput(raw)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	memoryUsage, err := ParseMemInfo(memRaw)
+	cpuUsage, err := parseCPUUsage(sections[collectSectionCPU])
 	if err != nil {
 		return Snapshot{}, err
 	}
-	diskUsage, err := ParseDF(diskRaw)
+	memoryUsage, err := ParseMemInfo(sections[collectSectionMemInfo])
 	if err != nil {
 		return Snapshot{}, err
 	}
-	load1, load5, load15, err := ParseLoadAvg(loadRaw)
+	diskUsage, err := ParseDF(sections[collectSectionDisk])
 	if err != nil {
 		return Snapshot{}, err
 	}
-	uptimeSeconds, err := ParseUptimeSeconds(uptimeRaw)
+	load1, load5, load15, err := ParseLoadAvg(sections[collectSectionLoad])
+	if err != nil {
+		return Snapshot{}, err
+	}
+	uptimeSeconds, err := ParseUptimeSeconds(sections[collectSectionUptime])
 	if err != nil {
 		return Snapshot{}, err
 	}
 
 	return Snapshot{
-		Online:        true,
-		SSHOK:         true,
-		CPUUsage:      cpuUsage,
-		MemoryUsage:   memoryUsage,
-		DiskUsage:     diskUsage,
-		OSVersion:     ParseOSRelease(osReleaseRaw),
-		KernelVersion: strings.TrimSpace(kernelRaw),
-		UptimeSeconds: uptimeSeconds,
-		Load1:         load1,
-		Load5:         load5,
-		Load15:        load15,
-		Source:        "ssh",
+		Online:            true,
+		SSHOK:             true,
+		CPUUsage:          cpuUsage,
+		MemoryUsage:       memoryUsage,
+		DiskUsage:         diskUsage,
+		OSVersion:         ParseOSRelease(sections[collectSectionOSRelease]),
+		KernelVersion:     strings.TrimSpace(sections[collectSectionKernel]),
+		UptimeSeconds:     uptimeSeconds,
+		Load1:             load1,
+		Load5:             load5,
+		Load15:            load15,
+		CollectDurationMS: time.Since(startedAt).Milliseconds(),
+		Source:            "ssh",
 	}, nil
 }
 
@@ -98,9 +129,60 @@ func (c *SSHCollector) runCommand(ctx context.Context, target sshx.Target, comma
 		return "", err
 	}
 	if exitCode != 0 {
-		return "", fmt.Errorf("执行采集命令失败: %s", strings.TrimSpace(stderr))
+		return "", collectCommandFailedError{message: fmt.Sprintf("执行采集命令失败: %s", strings.TrimSpace(stderr))}
 	}
 	return stdout, nil
+}
+
+func isHostKeyTrustError(err error) bool {
+	var trustRequired sshx.HostKeyTrustRequiredError
+	if errors.As(err, &trustRequired) {
+		return true
+	}
+	var mismatch sshx.HostKeyMismatchError
+	return errors.As(err, &mismatch)
+}
+
+func parseBatchCollectOutput(raw string) (map[string]string, error) {
+	sections := make(map[string][]string)
+	current := ""
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.HasPrefix(line, "__HOSTDECK__:") {
+			current = strings.TrimSpace(strings.TrimPrefix(line, "__HOSTDECK__:"))
+			if current == "" {
+				return nil, fmt.Errorf("采集输出分段标记为空")
+			}
+			if _, ok := sections[current]; !ok {
+				sections[current] = nil
+			}
+			continue
+		}
+		if current == "" {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			return nil, fmt.Errorf("采集输出缺少分段标记")
+		}
+		sections[current] = append(sections[current], line)
+	}
+
+	result := make(map[string]string, 7)
+	for _, name := range []string{
+		collectSectionCPU,
+		collectSectionMemInfo,
+		collectSectionDisk,
+		collectSectionLoad,
+		collectSectionOSRelease,
+		collectSectionKernel,
+		collectSectionUptime,
+	} {
+		lines, ok := sections[name]
+		if !ok || len(lines) == 0 {
+			return nil, fmt.Errorf("采集输出缺少 %s 分段", name)
+		}
+		result[name] = strings.TrimSpace(strings.Join(lines, "\n"))
+	}
+	return result, nil
 }
 
 func parseCPUUsage(raw string) (float64, error) {

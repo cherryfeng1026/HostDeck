@@ -538,26 +538,18 @@ func alertHistoryTitle(eventType string) string {
 }
 
 func routePathForAlert(serverID int64) string {
-	if serverID > 0 {
-		return "/alerts"
-	}
+	_ = serverID
 	return "/alerts"
 }
 
 func routePathForCommand(serverID int64) string {
-	if serverID > 0 {
-		return "/commands"
-	}
+	_ = serverID
 	return "/commands"
 }
 
 func routePathForAuthEvent(eventType string) string {
-	switch eventType {
-	case domain.AuthEventBootstrapAdminCreated, domain.AuthEventPasswordChanged, domain.AuthEventLoginFailed, domain.AuthEventLoginSucceeded, domain.AuthEventLogout:
-		return "/users"
-	default:
-		return "/users"
-	}
+	_ = eventType
+	return "/users"
 }
 
 func routePathForAudit(kind string, serverID int64) string {

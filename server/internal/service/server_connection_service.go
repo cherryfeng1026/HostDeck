@@ -14,7 +14,8 @@ import (
 
 var ErrConnectionServerNotFound = errors.New("服务器不存在")
 var ErrServerDisabled = errors.New("服务器已禁用")
-var ErrServerPasswordNotConfigured = errors.New("服务器未配置 SSH 密码")
+var ErrServerCredentialNotConfigured = errors.New("服务器未配置 SSH 凭据")
+var ErrServerPasswordNotConfigured = ErrServerCredentialNotConfigured
 
 type ConnectionServerStore interface {
 	List(ctx context.Context, filter storage.ServerFilter) ([]domain.Server, error)
@@ -60,25 +61,37 @@ func (s *ServerConnectionService) ResolveServer(ctx context.Context, serverID in
 	credentialItem, err := s.credentials.GetByServerID(ctx, serverID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return domain.Server{}, ErrServerPasswordNotConfigured
+			return domain.Server{}, ErrServerCredentialNotConfigured
 		}
 		return domain.Server{}, err
 	}
-	if strings.TrimSpace(credentialItem.PasswordCiphertext) == "" {
-		return domain.Server{}, ErrServerPasswordNotConfigured
+
+	ciphertext := strings.TrimSpace(credentialItem.PasswordCiphertext)
+	target := "password"
+	if server.AuthType == "private_key" {
+		ciphertext = strings.TrimSpace(credentialItem.PrivateKeyCiphertext)
+		target = "private_key"
+	}
+	if ciphertext == "" {
+		return domain.Server{}, ErrServerCredentialNotConfigured
 	}
 
 	cipher, err := credential.NewCipher(s.masterKey)
 	if err != nil {
 		return domain.Server{}, err
 	}
-	password, err := cipher.Decrypt(credentialItem.PasswordCiphertext)
+	secret, err := cipher.Decrypt(ciphertext)
 	if err != nil {
-		return domain.Server{}, fmt.Errorf("解密服务器密码失败: %w", err)
+		return domain.Server{}, fmt.Errorf("解密服务器凭据失败: %w", err)
 	}
 
-	server.Password = password
-	server.PasswordConfigured = true
+	if target == "private_key" {
+		server.PrivateKey = secret
+		server.PrivateKeyConfigured = true
+	} else {
+		server.Password = secret
+		server.PasswordConfigured = true
+	}
 	return server, nil
 }
 

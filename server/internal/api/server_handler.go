@@ -45,11 +45,13 @@ type serverPayload struct {
 	Username                  string   `json:"username"`
 	AuthType                  string   `json:"authType"`
 	Password                  string   `json:"password"`
+	PrivateKey                string   `json:"privateKey"`
 	TrustedHostKeyFingerprint string   `json:"trustedHostKeyFingerprint"`
 	CollectorMode             string   `json:"collectorMode"`
 	Tags                      []string `json:"tags"`
 	Purpose                   string   `json:"purpose"`
 	Remark                    string   `json:"remark"`
+	ExpiresAt                 string   `json:"expiresAt"`
 	MaintenanceStartAt        string   `json:"maintenanceStartAt"`
 	MaintenanceEndAt          string   `json:"maintenanceEndAt"`
 	Enabled                   *bool    `json:"enabled"`
@@ -121,7 +123,7 @@ func (h *ServerHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ServerHandler) Create(w http.ResponseWriter, r *http.Request) {
-	item, err := decodeServerPayload(r, 0)
+	item, err := decodeServerPayload(w, r, 0)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -154,7 +156,7 @@ func (h *ServerHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := decodeServerPayload(r, id)
+	item, err := decodeServerPayload(w, r, id)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -189,24 +191,18 @@ func (h *ServerHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.Delete(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeServerStoreError(w, err)
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func decodeServerPayload(r *http.Request, id int64) (domain.Server, error) {
-	defer r.Body.Close()
-
-	var payload serverPayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&payload); err != nil {
+func decodeServerPayload(w http.ResponseWriter, r *http.Request, id int64) (domain.Server, error) {
+	payload, err := decodeJSON[serverPayload](w, r)
+	if err != nil {
 		return domain.Server{}, err
 	}
-
 	return payload.toDomain(id)
 }
 
@@ -241,16 +237,24 @@ func (p serverPayload) toDomain(id int64) (domain.Server, error) {
 		sshPort = 22
 	}
 
-	authType := strings.TrimSpace(p.AuthType)
-	if authType == "" {
-		authType = "password"
+	authType, err := normalizeServerAuthType(p.AuthType)
+	if err != nil {
+		return domain.Server{}, err
 	}
 	password := strings.TrimSpace(p.Password)
 	if authType == "password" && id == 0 && password == "" {
 		return domain.Server{}, errors.New("SSH 密码不能为空")
 	}
+	privateKey := strings.TrimSpace(p.PrivateKey)
+	if authType == "private_key" && id == 0 && privateKey == "" {
+		return domain.Server{}, errors.New("SSH 私钥不能为空")
+	}
 
 	collectorMode := domain.NormalizeCollectorMode(p.CollectorMode)
+	expiresAt, err := parseOptionalRFC3339(p.ExpiresAt, "过期时间格式无效")
+	if err != nil {
+		return domain.Server{}, err
+	}
 	maintenanceStartAt, maintenanceEndAt, err := parseMaintenanceWindow(p.MaintenanceStartAt, p.MaintenanceEndAt)
 	if err != nil {
 		return domain.Server{}, err
@@ -270,15 +274,28 @@ func (p serverPayload) toDomain(id int64) (domain.Server, error) {
 		Username:                  username,
 		AuthType:                  authType,
 		Password:                  password,
+		PrivateKey:                privateKey,
 		TrustedHostKeyFingerprint: strings.TrimSpace(p.TrustedHostKeyFingerprint),
 		CollectorMode:             collectorMode,
 		Tags:                      tags,
 		Purpose:                   strings.TrimSpace(p.Purpose),
 		Remark:                    strings.TrimSpace(p.Remark),
+		ExpiresAt:                 expiresAt,
 		MaintenanceStartAt:        maintenanceStartAt,
 		MaintenanceEndAt:          maintenanceEndAt,
 		Enabled:                   enabled,
 	}, nil
+}
+
+func normalizeServerAuthType(value string) (string, error) {
+	switch strings.TrimSpace(value) {
+	case "", "password":
+		return "password", nil
+	case "private_key", "key":
+		return "private_key", nil
+	default:
+		return "", errors.New("SSH 连接方式无效")
+	}
 }
 
 func parseServerID(r *http.Request) (int64, error) {
@@ -310,6 +327,19 @@ func parseMaintenanceWindow(startRaw string, endRaw string) (*time.Time, *time.T
 	return &startAt, &endAt, nil
 }
 
+func parseOptionalRFC3339(raw string, errorMessage string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, errors.New(errorMessage)
+	}
+	parsed = parsed.UTC()
+	return &parsed, nil
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -317,14 +347,42 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
+	msg := err.Error()
+	// 5xx 错误脱敏：不向客户端泄露内部错误细节
+	if status >= 500 {
+		msg = "内部服务器错误"
+	}
 	writeJSON(w, status, map[string]string{
-		"error": err.Error(),
+		"error": msg,
 	})
+}
+
+const defaultMaxBodyBytes = 128 * 1024
+
+func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, error) {
+	defer r.Body.Close()
+
+	var v T
+	r.Body = http.MaxBytesReader(w, r.Body, defaultMaxBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&v); err != nil {
+		return v, err
+	}
+	return v, nil
 }
 
 func writeServerStoreError(w http.ResponseWriter, err error) {
 	if errors.Is(err, storage.ErrServerIPConflict) {
 		writeError(w, http.StatusConflict, err)
+		return
+	}
+	if errors.Is(err, storage.ErrServerNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if errors.Is(err, storage.ErrServerCredentialRequired) {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	writeError(w, http.StatusInternalServerError, err)

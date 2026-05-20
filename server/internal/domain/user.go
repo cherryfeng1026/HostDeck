@@ -22,6 +22,17 @@ const (
 	AuthEventAPITokenRevoked       = "api_token_revoked"
 )
 
+const (
+	ScopeAll                   = "*"
+	ScopeServersRead           = "servers:read"
+	ScopeServersWrite          = "servers:write"
+	ScopeCommandsRead          = "commands:read"
+	ScopeCommandsExecute       = "commands:execute"
+	ScopeCommandTemplatesWrite = "commands:templates:write"
+	ScopeAlertsRead            = "alerts:read"
+	ScopeAlertsWrite           = "alerts:write"
+)
+
 type User struct {
 	ID          int64      `json:"id"`
 	Username    string     `json:"username"`
@@ -53,16 +64,17 @@ type AuthEvent struct {
 }
 
 type APIToken struct {
-	ID          int64      `json:"id"`
-	UserID      int64      `json:"userId"`
-	Name        string     `json:"name"`
-	Prefix      string     `json:"prefix"`
-	LastUsedAt  *time.Time `json:"lastUsedAt,omitempty"`
-	ExpiresAt   *time.Time `json:"expiresAt,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	RevokedAt   *time.Time `json:"revokedAt,omitempty"`
-	IsActive    bool       `json:"isActive"`
+	ID         int64      `json:"id"`
+	UserID     int64      `json:"userId"`
+	Name       string     `json:"name"`
+	Prefix     string     `json:"prefix"`
+	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
+	ExpiresAt  *time.Time `json:"expiresAt,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
+	RevokedAt  *time.Time `json:"revokedAt,omitempty"`
+	IsActive   bool       `json:"isActive"`
+	Scopes     []string   `json:"scopes"`
 }
 
 func CanManageInfrastructure(role string) bool {

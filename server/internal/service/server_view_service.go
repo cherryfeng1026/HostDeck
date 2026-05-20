@@ -18,19 +18,27 @@ type LiveStatusStore interface {
 
 type LiveServerItem struct {
 	domain.Server
-	Online        bool      `json:"online"`
-	SSHOK         bool      `json:"sshOk"`
-	CPUUsage      float64   `json:"cpuUsage"`
-	MemoryUsage   float64   `json:"memoryUsage"`
-	DiskUsage     float64   `json:"diskUsage"`
-	OSVersion     string    `json:"osVersion"`
-	KernelVersion string    `json:"kernelVersion"`
-	UptimeSeconds int64     `json:"uptimeSeconds"`
-	Load1         float64   `json:"load1"`
-	Load5         float64   `json:"load5"`
-	Load15        float64   `json:"load15"`
-	LastReportAt  time.Time `json:"lastReportAt"`
-	Source        string    `json:"source"`
+	Online                bool      `json:"online"`
+	SSHOK                 bool      `json:"sshOk"`
+	CPUUsage              float64   `json:"cpuUsage"`
+	MemoryUsage           float64   `json:"memoryUsage"`
+	DiskUsage             float64   `json:"diskUsage"`
+	OSVersion             string    `json:"osVersion"`
+	KernelVersion         string    `json:"kernelVersion"`
+	UptimeSeconds         int64     `json:"uptimeSeconds"`
+	Load1                 float64   `json:"load1"`
+	Load5                 float64   `json:"load5"`
+	Load15                float64   `json:"load15"`
+	LastReportAt          time.Time `json:"lastReportAt"`
+	Source                string    `json:"source"`
+	CollectStatus         string    `json:"collectStatus"`
+	LastCollectStartedAt  time.Time `json:"lastCollectStartedAt"`
+	LastCollectFinishedAt time.Time `json:"lastCollectFinishedAt"`
+	LastSuccessAt         time.Time `json:"lastSuccessAt"`
+	LastCollectError      string    `json:"lastCollectError"`
+	CollectFailureCount   int       `json:"collectFailureCount"`
+	CollectDurationMS     int64     `json:"collectDurationMs"`
+	Stale                 bool      `json:"stale"`
 }
 
 type ServerViewService struct {
@@ -77,6 +85,14 @@ func (s *ServerViewService) ListLive(ctx context.Context, filter storage.ServerF
 			item.Load15 = status.Load15
 			item.LastReportAt = status.LastReportAt
 			item.Source = status.Source
+			item.CollectStatus = status.CollectStatus
+			item.LastCollectStartedAt = status.LastCollectStartedAt
+			item.LastCollectFinishedAt = status.LastCollectFinishedAt
+			item.LastSuccessAt = status.LastSuccessAt
+			item.LastCollectError = status.LastCollectError
+			item.CollectFailureCount = status.CollectFailureCount
+			item.CollectDurationMS = status.CollectDurationMS
+			item.Stale = status.Stale
 		}
 		items = append(items, item)
 	}

@@ -4,7 +4,81 @@ export interface OverviewResponse {
   offlineServers: number
   activeAlerts: number
   sshFailures: number
+  collectFailedServers: number
+  collectStaleServers: number
 }
+
+export interface DashboardHeadline {
+  totalServers: number
+  onlineServers: number
+  offlineServers: number
+  activeAlerts: number
+  sshFailures: number
+  collectFailedServers: number
+  collectStaleServers: number
+  lastUpdatedAt: string
+}
+
+export interface DashboardTrendPoint {
+  sampledAt: string
+  avgCpuUsage: number
+  avgMemoryUsage: number
+  avgDiskUsage: number
+  avgLoad1: number
+  avgLoad5: number
+  avgLoad15: number
+  sampleCount: number
+  fallback?: boolean
+}
+
+export type DashboardRange = '1h' | '6h' | '24h' | '7d'
+
+export interface DashboardTopServer {
+  id: number
+  name: string
+  hostname: string
+  ip: string
+  purpose: string
+  online: boolean
+  sshOk: boolean
+  cpuUsage: number
+  memoryUsage: number
+  diskUsage: number
+  load1: number
+  lastReportAt: string
+  rankReason: string
+}
+
+export interface DashboardResourceSummary {
+  reportingServers: number
+  unhealthyServers: number
+  collectFailedServers: number
+  collectStaleServers: number
+  avgCpuUsage: number
+  avgMemoryUsage: number
+  avgDiskUsage: number
+  peakCpuUsage: number
+  peakMemoryUsage: number
+  peakDiskUsage: number
+}
+
+export interface DashboardAlertSummary {
+  total: number
+  critical: number
+  warning: number
+  acknowledged: number
+  muted: number
+}
+
+export interface DashboardOverviewResponse {
+  headline: DashboardHeadline
+  trends: DashboardTrendPoint[]
+  topServers: DashboardTopServer[]
+  resourceSummary: DashboardResourceSummary
+  alertSummary: DashboardAlertSummary
+}
+
+export type ThemeMode = 'dark' | 'light'
 
 export interface ServerAsset {
   id: number
@@ -15,11 +89,13 @@ export interface ServerAsset {
   username: string
   authType: string
   passwordConfigured: boolean
+  privateKeyConfigured: boolean
   trustedHostKeyFingerprint: string
   collectorMode: string
   tags: string[]
   purpose: string
   remark: string
+  expiresAt?: string
   maintenanceStartAt?: string
   maintenanceEndAt?: string
   enabled: boolean
@@ -41,6 +117,14 @@ export interface LiveServerItem extends ServerAsset {
   load15: number
   lastReportAt: string
   source: string
+  collectStatus: string
+  lastCollectStartedAt: string
+  lastCollectFinishedAt: string
+  lastSuccessAt: string
+  lastCollectError: string
+  collectFailureCount: number
+  collectDurationMs: number
+  stale: boolean
 }
 
 export type ServerListItem = LiveServerItem
@@ -68,6 +152,14 @@ export interface ServerStatusDetail {
   load15: number
   lastReportAt: string
   source: string
+  collectStatus: string
+  lastCollectStartedAt: string
+  lastCollectFinishedAt: string
+  lastSuccessAt: string
+  lastCollectError: string
+  collectFailureCount: number
+  collectDurationMs: number
+  stale: boolean
 }
 
 export interface MetricPoint {
@@ -91,6 +183,7 @@ export interface TestSSHResponse {
   hostKeyFingerprint?: string
   trustedHostKeyFingerprint?: string
   fingerprintMismatch?: boolean
+  trustRequired?: boolean
 }
 
 export interface ProbeResponse {
@@ -106,6 +199,7 @@ export interface ProbeResponse {
     load1: number
     load5: number
     load15: number
+    collectDurationMs: number
     source: string
   }
 }
@@ -117,6 +211,10 @@ export interface CommandResult {
   exitCode: number
   durationMs: number
   executedAt: string
+  source: string
+  templateId?: string
+  riskLevel: string
+  riskConfirmed: boolean
 }
 
 export interface BatchCommandResult {
@@ -135,13 +233,20 @@ export interface CommandHistoryRecord {
   id: number
   serverId: number
   serverName: string
+  serverIp: string
   executorUsername: string
+  executorAuthMethod: string
   command: string
   stdout: string
   stderr: string
   exitCode: number
   durationMs: number
   executedAt: string
+  source: string
+  templateId?: string
+  riskLevel: string
+  riskConfirmed: boolean
+  requestId?: string
 }
 
 export interface CommandHistoryQuery {
@@ -200,6 +305,8 @@ export interface AlertRule {
   threshold: number
   durationSeconds: number
   enabled: boolean
+  scopeType: string
+  scopeValue: string
   createdAt: string
   updatedAt: string
 }
@@ -254,6 +361,27 @@ export interface AlertNotificationSettings {
   updatedAt?: string
 }
 
+export interface AlertNotificationDelivery {
+  id: number
+  eventType: string
+  alertId: number
+  ruleId: number
+  serverId: number
+  serverName: string
+  status: string
+  attemptCount: number
+  nextAttemptAt?: string
+  lastAttemptAt?: string
+  lastError?: string
+  occurredAt: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AlertNotificationRetryResponse {
+  retried: number
+}
+
 export interface User {
   id: number
   username: string
@@ -289,6 +417,9 @@ export interface AuthResponse {
 export interface AuthStatusResponse {
   initialized: boolean
   bootstrapEnabled: boolean
+  authenticated: boolean
+  user?: User
+  permissions?: UserPermissions
 }
 
 export interface UserListResponse {
@@ -300,6 +431,7 @@ export interface APITokenItem {
   userId: number
   name: string
   prefix: string
+  scopes: string[]
   lastUsedAt?: string
   expiresAt?: string
   createdAt: string
@@ -315,6 +447,7 @@ export interface APITokenListResponse {
 export interface CreateAPITokenPayload {
   name: string
   expiresInHours: number
+  scopes?: string[]
 }
 
 export interface CreateAPITokenResponse {
@@ -356,11 +489,13 @@ export interface ServerPayload {
   username: string
   authType?: string
   password?: string
+  privateKey?: string
   trustedHostKeyFingerprint?: string
   collectorMode: string
   tags: string[]
   purpose?: string
   remark?: string
+  expiresAt?: string
   maintenanceStartAt?: string
   maintenanceEndAt?: string
   enabled?: boolean

@@ -14,6 +14,20 @@ const (
 	AlertEventAcknowledged = "acknowledged"
 	AlertEventMuted        = "muted"
 	AlertEventResolved     = "resolved"
+	AlertEventTest         = "test"
+)
+
+const (
+	AlertRuleScopeAll     = "all"
+	AlertRuleScopeServer  = "server"
+	AlertRuleScopeTag     = "tag"
+	AlertRuleScopePurpose = "purpose"
+)
+
+const (
+	AlertNotificationDeliveryPending = "pending"
+	AlertNotificationDeliverySent    = "sent"
+	AlertNotificationDeliveryFailed  = "failed"
 )
 
 type AlertRule struct {
@@ -23,6 +37,8 @@ type AlertRule struct {
 	Threshold       float64   `json:"threshold"`
 	DurationSeconds int       `json:"durationSeconds"`
 	Enabled         bool      `json:"enabled"`
+	ScopeType       string    `json:"scopeType"`
+	ScopeValue      string    `json:"scopeValue"`
 	CreatedAt       time.Time `json:"createdAt"`
 	UpdatedAt       time.Time `json:"updatedAt"`
 }
@@ -96,4 +112,29 @@ type AlertNotificationSettings struct {
 	WebhookTimeoutSeconds int       `json:"webhookTimeoutSeconds"`
 	CreatedAt             time.Time `json:"createdAt,omitempty"`
 	UpdatedAt             time.Time `json:"updatedAt,omitempty"`
+}
+
+type AlertNotificationDelivery struct {
+	ID            int64      `json:"id"`
+	EventType     string     `json:"eventType"`
+	AlertID       int64      `json:"alertId"`
+	RuleID        int64      `json:"ruleId"`
+	ServerID      int64      `json:"serverId"`
+	ServerName    string     `json:"serverName"`
+	Status        string     `json:"status"`
+	AttemptCount  int        `json:"attemptCount"`
+	NextAttemptAt *time.Time `json:"nextAttemptAt,omitempty"`
+	LastAttemptAt *time.Time `json:"lastAttemptAt,omitempty"`
+	LastError     string     `json:"lastError,omitempty"`
+	Payload       string     `json:"-"`
+	OccurredAt    time.Time  `json:"occurredAt"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+}
+
+type AlertNotificationDeliveryFilter struct {
+	Status  string
+	Limit   int
+	DueOnly bool
+	Now     time.Time
 }

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -57,7 +56,7 @@ func (h *ShellHandler) MarkNotificationsRead(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusUnauthorized, service.ErrUnauthenticated)
 		return
 	}
-	readBefore, err := decodeMarkNotificationsReadPayload(r)
+	readBefore, err := decodeMarkNotificationsReadPayload(w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -69,12 +68,9 @@ func (h *ShellHandler) MarkNotificationsRead(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func decodeMarkNotificationsReadPayload(r *http.Request) (time.Time, error) {
-	defer r.Body.Close()
-	var payload markNotificationsReadPayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
+func decodeMarkNotificationsReadPayload(w http.ResponseWriter, r *http.Request) (time.Time, error) {
+	payload, err := decodeJSON[markNotificationsReadPayload](w, r)
+	if err != nil {
 		return time.Time{}, errors.New("readBefore 参数无效")
 	}
 	readBefore := strings.TrimSpace(payload.ReadBefore)

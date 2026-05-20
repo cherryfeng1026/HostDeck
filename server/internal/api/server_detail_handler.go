@@ -69,15 +69,16 @@ func (h *ServerDetailHandler) GetServerMetrics(w http.ResponseWriter, r *http.Re
 }
 
 func parseMetricsRange(value string) (time.Time, error) {
+	now := time.Now().UTC()
 	switch strings.TrimSpace(value) {
 	case "1h":
-		return time.Now().Add(-time.Hour), nil
+		return now.Add(-time.Hour), nil
 	case "6h":
-		return time.Now().Add(-6 * time.Hour), nil
+		return now.Add(-6 * time.Hour), nil
 	case "24h":
-		return time.Now().Add(-24 * time.Hour), nil
+		return now.Add(-24 * time.Hour), nil
 	case "7d":
-		return time.Now().Add(-7 * 24 * time.Hour), nil
+		return now.Add(-7 * 24 * time.Hour), nil
 	default:
 		return time.Time{}, errors.New("不支持的时间范围")
 	}

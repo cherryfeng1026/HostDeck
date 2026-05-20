@@ -174,6 +174,148 @@ func TestAlertRepository_SaveNotificationSettingsRejectsMissingMasterKey(t *test
 	}
 }
 
+func TestAlertRepository_UpdateReturnsNotFoundWhenRuleMissing(t *testing.T) {
+	db := openTestDB(t)
+	repo := storage.NewAlertRepository(db)
+
+	err := repo.Update(context.Background(), domain.AlertRule{
+		ID:              999,
+		Metric:          "memory_usage",
+		Operator:        "gte",
+		Threshold:       80,
+		DurationSeconds: 60,
+		Enabled:         true,
+		ScopeType:       domain.AlertRuleScopeAll,
+	})
+	if !errors.Is(err, storage.ErrAlertRuleNotFound) {
+		t.Fatalf("expected ErrAlertRuleNotFound, got %v", err)
+	}
+}
+
+func TestAlertRepository_DeleteReturnsNotFoundWhenRuleMissing(t *testing.T) {
+	db := openTestDB(t)
+	repo := storage.NewAlertRepository(db)
+
+	err := repo.Delete(context.Background(), 999)
+	if !errors.Is(err, storage.ErrAlertRuleNotFound) {
+		t.Fatalf("expected ErrAlertRuleNotFound, got %v", err)
+	}
+}
+
+func TestAlertRepository_DeleteClearsStatesAndRecordsResolvedHistory(t *testing.T) {
+	db := openTestDB(t)
+	repo := storage.NewAlertRepository(db)
+	seedAlertStateForRepositoryTest(t, repo, domain.AlertStatusActive)
+
+	if err := repo.Delete(context.Background(), 1); err != nil {
+		t.Fatalf("delete alert rule: %v", err)
+	}
+
+	rules, err := repo.List(context.Background())
+	if err != nil {
+		t.Fatalf("list rules: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("expected deleted rule to disappear, got %+v", rules)
+	}
+	states, err := repo.ListCurrentStates(context.Background())
+	if err != nil {
+		t.Fatalf("list states: %v", err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("expected states to be cleared, got %+v", states)
+	}
+	history, err := repo.ListHistory(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(history) != 2 || history[0].EventType != domain.AlertEventResolved || history[0].Detail != "规则已删除" {
+		t.Fatalf("expected resolved history entry for deleted rule, got %+v", history)
+	}
+}
+
+func TestAlertRepository_RuleScopePersistsAndUpdates(t *testing.T) {
+	db := openTestDB(t)
+	repo := storage.NewAlertRepository(db)
+
+	if err := repo.Create(context.Background(), domain.AlertRule{
+		Metric:          "memory_usage",
+		Operator:        "gte",
+		Threshold:       80,
+		DurationSeconds: 60,
+		Enabled:         true,
+		ScopeType:       domain.AlertRuleScopeTag,
+		ScopeValue:      "prod",
+	}); err != nil {
+		t.Fatalf("create scoped alert rule: %v", err)
+	}
+	rules, err := repo.List(context.Background())
+	if err != nil {
+		t.Fatalf("list scoped alert rules: %v", err)
+	}
+	if len(rules) != 1 || rules[0].ScopeType != domain.AlertRuleScopeTag || rules[0].ScopeValue != "prod" {
+		t.Fatalf("unexpected scoped rule after create: %+v", rules)
+	}
+
+	rules[0].ScopeType = domain.AlertRuleScopeAll
+	rules[0].ScopeValue = "ignored"
+	if err := repo.Update(context.Background(), rules[0]); err != nil {
+		t.Fatalf("update scoped alert rule: %v", err)
+	}
+	rules, err = repo.List(context.Background())
+	if err != nil {
+		t.Fatalf("reload scoped alert rules: %v", err)
+	}
+	if rules[0].ScopeType != domain.AlertRuleScopeAll || rules[0].ScopeValue != "" {
+		t.Fatalf("expected all scope to clear value, got %+v", rules[0])
+	}
+}
+
+func TestAlertRepository_NotificationDeliveryLifecycle(t *testing.T) {
+	db := openTestDB(t)
+	repo := storage.NewAlertRepository(db)
+	now := time.Date(2026, 4, 22, 10, 0, 0, 0, time.UTC)
+
+	delivery, err := repo.CreateNotificationDelivery(context.Background(), domain.AlertNotificationDelivery{
+		EventType:  domain.AlertEventTriggered,
+		AlertID:    11,
+		RuleID:     3,
+		ServerID:   1,
+		ServerName: "prod-web-01",
+		Status:     domain.AlertNotificationDeliveryPending,
+		OccurredAt: now,
+	}, `{"eventType":"triggered"}`)
+	if err != nil {
+		t.Fatalf("create notification delivery: %v", err)
+	}
+	if delivery.ID == 0 || delivery.Payload == "" || delivery.Status != domain.AlertNotificationDeliveryPending {
+		t.Fatalf("unexpected created delivery: %+v", delivery)
+	}
+
+	nextAttemptAt := now.Add(time.Minute)
+	if err := repo.RecordNotificationDeliveryAttempt(context.Background(), delivery.ID, domain.AlertNotificationDeliveryFailed, "temporary failure", &nextAttemptAt, now); err != nil {
+		t.Fatalf("record notification attempt: %v", err)
+	}
+	items, err := repo.ListNotificationDeliveries(context.Background(), domain.AlertNotificationDeliveryFilter{Status: domain.AlertNotificationDeliveryFailed, DueOnly: true, Now: now.Add(2 * time.Minute), Limit: 10})
+	if err != nil {
+		t.Fatalf("list failed deliveries: %v", err)
+	}
+	if len(items) != 1 || items[0].AttemptCount != 1 || items[0].LastError != "temporary failure" || items[0].NextAttemptAt == nil || items[0].Payload == "" {
+		t.Fatalf("unexpected failed delivery: %+v", items)
+	}
+
+	if err := repo.RecordNotificationDeliveryAttempt(context.Background(), delivery.ID, domain.AlertNotificationDeliverySent, "", nil, now.Add(3*time.Minute)); err != nil {
+		t.Fatalf("record sent notification attempt: %v", err)
+	}
+	items, err = repo.ListNotificationDeliveries(context.Background(), domain.AlertNotificationDeliveryFilter{Status: domain.AlertNotificationDeliverySent, Limit: 10})
+	if err != nil {
+		t.Fatalf("list sent deliveries: %v", err)
+	}
+	if len(items) != 1 || items[0].AttemptCount != 2 || items[0].LastError != "" || items[0].NextAttemptAt != nil {
+		t.Fatalf("unexpected sent delivery: %+v", items)
+	}
+}
+
 func TestAlertRepository_ListHistoryByTypesFiltersAtQueryLevel(t *testing.T) {
 	db := openTestDB(t)
 	repo := storage.NewAlertRepository(db)
@@ -214,6 +356,77 @@ func TestAlertRepository_SearchHistoryFiltersBeforeLimit(t *testing.T) {
 	}
 }
 
+func TestAlertRepository_HistoryKeepsServerNameSnapshotAfterRename(t *testing.T) {
+	db := openTestDB(t)
+	repo := storage.NewAlertRepository(db)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 22, 10, 0, 0, 0, time.UTC)
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO servers (id, name, hostname, ip, ssh_port, username, auth_type, credential_ref, collector_mode, tags, purpose, remark, enabled, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		1, "prod-web-01", "prod-web-01", "10.0.0.21", 22, "root", "password", "", "ssh_only", "[]", "", "", 1, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed server: %v", err)
+	}
+	if err := repo.Create(ctx, domain.AlertRule{
+		Metric:          "disk_usage",
+		Operator:        "gte",
+		Threshold:       80,
+		DurationSeconds: 0,
+		Enabled:         true,
+	}); err != nil {
+		t.Fatalf("create alert rule: %v", err)
+	}
+	state, _, err := repo.UpsertEvaluation(ctx, storage.AlertEvaluationRecord{
+		RuleID:          1,
+		ServerID:        1,
+		Metric:          "disk_usage",
+		Operator:        "gte",
+		Threshold:       80,
+		CurrentValue:    90,
+		Severity:        "warning",
+		Message:         "disk usage exceeded",
+		Status:          domain.AlertStatusActive,
+		TriggeredAt:     now.Add(-time.Minute),
+		LastTriggeredAt: now,
+	})
+	if err != nil {
+		t.Fatalf("upsert evaluation: %v", err)
+	}
+	if err := repo.Resolve(ctx, state.ID, "metric recovered"); err != nil {
+		t.Fatalf("resolve alert: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE servers SET name = $1, updated_at = $2 WHERE id = $3`, "renamed-web-01", now.Add(time.Minute).Format(time.RFC3339Nano), 1); err != nil {
+		t.Fatalf("rename server: %v", err)
+	}
+
+	history, err := repo.ListHistory(ctx, 10)
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("expected triggered and resolved history, got %d %+v", len(history), history)
+	}
+	for _, item := range history {
+		if item.ServerName != "prod-web-01" {
+			t.Fatalf("expected server name snapshot to remain prod-web-01, got %+v", item)
+		}
+	}
+
+	oldNameResults, err := repo.SearchHistory(ctx, "prod-web-01", 10)
+	if err != nil {
+		t.Fatalf("search old server name: %v", err)
+	}
+	if len(oldNameResults) != 2 {
+		t.Fatalf("expected search by snapshot name to find history, got %d %+v", len(oldNameResults), oldNameResults)
+	}
+	newNameResults, err := repo.SearchHistory(ctx, "renamed-web-01", 10)
+	if err != nil {
+		t.Fatalf("search renamed server name: %v", err)
+	}
+	if len(newNameResults) != 0 {
+		t.Fatalf("expected renamed server name not to rewrite history search, got %+v", newNameResults)
+	}
+}
+
 func seedAlertHistoryForRepositoryQueryTest(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
@@ -225,12 +438,12 @@ func seedAlertHistoryForRepositoryQueryTest(t *testing.T, db *sql.DB) {
 	}
 
 	entries := []struct {
-		alertID     int64
-		eventType   string
-		message     string
-		detail      string
-		createdAt   time.Time
-		actor       string
+		alertID   int64
+		eventType string
+		message   string
+		detail    string
+		createdAt time.Time
+		actor     string
 	}{
 		{alertID: 1, eventType: domain.AlertEventAcknowledged, message: "ack noise", detail: "ignore me", createdAt: now},
 		{alertID: 2, eventType: domain.AlertEventMuted, message: "mute noise", detail: "ignore me too", createdAt: now.Add(-1 * time.Minute)},

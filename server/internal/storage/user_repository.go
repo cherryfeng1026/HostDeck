@@ -72,7 +72,7 @@ func (r *UserRepository) Create(ctx context.Context, username string, passwordHa
 		username,
 		passwordHash,
 		role,
-		true,
+		boolToInt(true),
 		"",
 		now,
 		now,
@@ -227,7 +227,7 @@ func (r *UserRepository) Update(ctx context.Context, id int64, input UserUpdateI
 	}
 	if input.Enabled != nil {
 		fields = append(fields, "enabled = $"+strconv.Itoa(index))
-		args = append(args, *input.Enabled)
+		args = append(args, boolToInt(*input.Enabled))
 		index++
 	}
 	if len(fields) == 0 {

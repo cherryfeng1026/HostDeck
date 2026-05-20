@@ -20,6 +20,7 @@ type Target struct {
 	Password                  string
 	PrivateKeyPEM             string
 	TrustedHostKeyFingerprint string
+	AllowUnknownHostKey       bool
 	Timeout                   time.Duration
 }
 
@@ -38,6 +39,17 @@ type HostKeyMismatchError struct {
 
 func (e HostKeyMismatchError) Error() string {
 	return fmt.Sprintf("SSH 主机指纹不匹配，期望 %s，实际 %s", e.Expected, e.Actual)
+}
+
+type HostKeyTrustRequiredError struct {
+	Actual string
+}
+
+func (e HostKeyTrustRequiredError) Error() string {
+	if strings.TrimSpace(e.Actual) == "" {
+		return "SSH 主机指纹尚未信任"
+	}
+	return fmt.Sprintf("SSH 主机指纹尚未信任: %s", e.Actual)
 }
 
 type sessionClient interface {
@@ -87,7 +99,26 @@ func (c *Client) Run(ctx context.Context, target Target, command string) (string
 	session.SetStdout(&stdout)
 	session.SetStderr(&stderr)
 
-	err = session.Run(command)
+	if err := ctx.Err(); err != nil {
+		return "", "", -1, err
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- session.Run(command)
+	}()
+
+	select {
+	case err = <-errCh:
+	case <-ctx.Done():
+		_ = session.Close()
+		_ = client.Close()
+		select {
+		case <-errCh:
+		case <-time.After(100 * time.Millisecond):
+		}
+		return stdout.String(), stderr.String(), -1, ctx.Err()
+	}
 	if err != nil {
 		if exitCode, ok := exitCodeFromError(err); ok {
 			return stdout.String(), stderr.String(), exitCode, nil
@@ -99,6 +130,7 @@ func (c *Client) Run(ctx context.Context, target Target, command string) (string
 }
 
 func (c *Client) GetHostKeyFingerprint(ctx context.Context, target Target) (string, error) {
+	target.AllowUnknownHostKey = true
 	capture := &hostKeyCapture{}
 	config, err := buildSSHConfig(target, capture)
 	if err != nil {
@@ -168,11 +200,17 @@ type hostKeyCapture struct {
 	actual string
 }
 
-func (c *hostKeyCapture) callback(expected string) ssh.HostKeyCallback {
-	expected = strings.TrimSpace(expected)
+func (c *hostKeyCapture) callback(target Target) ssh.HostKeyCallback {
+	expected := strings.TrimSpace(target.TrustedHostKeyFingerprint)
 	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
 		c.actual = ssh.FingerprintSHA256(key)
-		if expected != "" && !strings.EqualFold(expected, c.actual) {
+		if expected == "" {
+			if target.AllowUnknownHostKey {
+				return nil
+			}
+			return HostKeyTrustRequiredError{Actual: c.actual}
+		}
+		if !strings.EqualFold(expected, c.actual) {
 			return HostKeyMismatchError{Expected: expected, Actual: c.actual}
 		}
 		return nil
@@ -211,25 +249,35 @@ func buildSSHConfig(target Target, capture *hostKeyCapture) (*ssh.ClientConfig, 
 		capture = &hostKeyCapture{}
 	}
 
+	authMethods, err := buildAuthMethods(target)
+	if err != nil {
+		return nil, err
+	}
+
 	return &ssh.ClientConfig{
 		User:            target.Username,
-		Auth:            buildAuthMethods(target),
-		HostKeyCallback: capture.callback(target.TrustedHostKeyFingerprint),
+		Auth:            authMethods,
+		HostKeyCallback: capture.callback(target),
 		Timeout:         target.timeoutOrDefault(),
 	}, nil
 }
 
-func buildAuthMethods(target Target) []ssh.AuthMethod {
+func buildAuthMethods(target Target) ([]ssh.AuthMethod, error) {
 	authMethods := make([]ssh.AuthMethod, 0, 2)
 	if target.Password != "" {
 		authMethods = append(authMethods, ssh.Password(target.Password))
 	}
 	if target.PrivateKeyPEM != "" {
-		if signer, err := ssh.ParsePrivateKey([]byte(target.PrivateKeyPEM)); err == nil {
-			authMethods = append(authMethods, ssh.PublicKeys(signer))
+		signer, err := ssh.ParsePrivateKey([]byte(target.PrivateKeyPEM))
+		if err != nil {
+			return nil, fmt.Errorf("SSH 私钥格式无效: %w", err)
 		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
-	return authMethods
+	if len(authMethods) == 0 {
+		return nil, errors.New("SSH 凭据不能为空")
+	}
+	return authMethods, nil
 }
 
 func exitCodeFromError(err error) (int, bool) {

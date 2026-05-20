@@ -1,126 +1,136 @@
 # HostDeck
 
-面向个人或小团队场景的轻量级 Linux 运维面板。后端使用 Go 单进程同时提供 API、定时采集与静态页面托管；前端使用 Vue 3 + Naive UI 展示总览、服务器列表、详情、命令执行和告警页面。
+HostDeck 是一个轻量级 Linux 运维面板。Go 后端单进程负责 API、静态页面托管、SSH 采集、远程命令、告警与清理任务；前端使用 Vue 3 展示控制台界面。
 
-## 当前能力
+## 功能
 
-- 基于会话 Cookie 的登录、登出、当前用户查询、用户列表查询与修改密码
-- 三种角色权限：`admin`、`operator`、`viewer`
-- 新增独立用户管理页，支持个人改密与管理员只读查看用户列表
-- 服务器资产增删改查
-- SSH 连通性测试与即时采集
-- 状态总览、单机详情、历史趋势
-- 单条命令远程执行与命令日志
-- 告警规则管理与当前告警视图
-- 通知列表、活动流与全局搜索
-- PostgreSQL / Neon 持久化
-- SSH 密码加密存储，页面只写不回显
-- 后端直接托管 `web/dist`，单进程运行整套系统
+- 登录、登出、会话 Cookie、管理员初始化
+- 角色权限：`admin`、`operator`、`viewer`
+- 服务器资产管理、SSH 连通性测试、主机指纹信任
+- 总览仪表盘、资源趋势、服务实例状态、最近活动
+- 远程命令执行、批量执行、命令模板、命令历史筛选
+- 告警规则、当前告警、告警历史、Webhook 通知
+- 用户管理、API Token、通知列表、全局搜索
+- 审计事件、认证事件、历史数据定期清理
+- PostgreSQL / Neon 持久化，SSH 凭据加密存储
 
 ## 技术栈
 
-- Backend: Go 1.25 + chi + database/sql
-- Frontend: Vue 3 + Vite + TypeScript + Naive UI + ECharts
+- Backend: Go 1.25, chi, database/sql
+- Frontend: Vue 3, Vite, TypeScript, Naive UI, ECharts
 - Database: PostgreSQL / Neon
-- SSH: `golang.org/x/crypto/ssh`
-- Config: YAML + 环境变量覆盖
+- Config: YAML，环境变量可覆盖部分配置
 
-## 目录结构
+## 目录
 
 ```text
 HostDeck/
-  docs/
-  server/
-    cmd/
-    config/
-    internal/
-    scripts/
-  web/
+  server/              Go 后端、配置示例、数据库迁移
+  web/                 Vue 前端
+  docs/                补充文档
+  compose.yaml         可选容器启动
+  Dockerfile           可选镜像构建
 ```
 
-## 环境要求
+## 本地启动
+
+准备：
 
 - Go 1.25+
-- Node.js 20+
-- npm 10+
-- PostgreSQL / Neon 数据库
+- Node.js 20+ 和 npm
+- 一个可访问的 PostgreSQL / Neon 数据库
 
-如果本机已经把 Go 安装到 `D:\dve\go` 并配置了 `GOROOT` / `Path`，重新打开终端后执行 `go version` 应可直接使用。
-
-## 快速启动
-
-1. 首次启动或前端改动后，先构建前端：
+首次启动：
 
 ```powershell
-Set-Location .\web
+cd web
 npm install
 npm run build
-```
 
-2. 准备配置文件：
-
-```powershell
-Set-Location ..\server
+cd ..\server
 Copy-Item .\config\config.example.yaml .\config\config.yaml
 ```
 
-3. 编辑 `server/config/config.yaml`，至少确认以下配置：
+编辑 `server/config/config.yaml`，至少改这几项：
 
-- `db_driver: "postgres"`
-- `db_dsn`: 你的 PostgreSQL / Neon 连接串
-- `master_key`: 必须替换 `change-me`，用于加密服务器 SSH 密码
-- `session_cookie_name`: 会话 Cookie 名称，默认 `hostdeck_session`
-- `session_ttl_hours`: 会话有效期，默认 24 小时
-- `bootstrap_admin_username` / `bootstrap_admin_password`: 可选，若同时配置则启动时优先创建指定管理员
-- `bootstrap_admin_token`: 可选，用于启用 `POST /api/auth/bootstrap-admin` 初始化接口
-- 若数据库内没有任何账号且未配置 bootstrap 管理员，系统会自动创建默认管理员 `admin / admin123`，首次登录后请立即修改密码
+```yaml
+db_dsn: "postgresql://user:password@localhost:5432/hostdeck?sslmode=require"
+master_key: "replace-with-a-long-random-secret"
+bootstrap_admin_username: "admin"
+bootstrap_admin_password: "replace-with-a-strong-password"
+web_dist_dir: "../../web/dist"
+```
 
-4. 启动后端：
+启动：
 
 ```powershell
 go run .\cmd\hostdeck --config .\config\config.yaml
 ```
 
-5. 验证启动：
+访问：
 
-```powershell
-Invoke-WebRequest http://127.0.0.1:18080/api/healthz
+- 页面：http://127.0.0.1:18080/
+- 健康检查：http://127.0.0.1:18080/api/healthz
+
+后续如果只改后端，直接重新运行 `go run`。如果改了前端，先在 `web/` 下重新执行 `npm run build`。
+
+## 配置说明
+
+配置文件在 `server/config/config.yaml`，不要提交真实配置。
+
+常用项：
+
+- `http_addr`: 监听地址，默认 `:18080`
+- `db_dsn`: PostgreSQL / Neon DSN，必填
+- `master_key`: SSH 凭据加密密钥，生产环境必须长期备份
+- `bootstrap_admin_username` / `bootstrap_admin_password`: 首次启动时创建管理员
+- `bootstrap_admin_token`: 使用初始化接口创建管理员时的令牌
+- `session_cookie_secure`: HTTPS 下建议设为 `true`
+- `log_file`: 可选文件日志路径，Docker 部署建议 `/app/logs/hostdeck.log`
+- `log_max_size_mb` / `log_max_backups` / `log_max_age_days`: 文件日志轮转与清理策略
+- `poll_interval_seconds`: SSH 采集周期
+- `poll_concurrency`: 并发采集数
+- `*_retention_hours`: 历史数据保留时间
+- `alert_webhook_url`: 可选告警 Webhook 初始值
+
+## 可选 Docker
+
+默认 Compose 只启动 HostDeck 应用，不内置数据库。先准备外部 PostgreSQL / Neon，并把 `server/config/config.yaml` 中的 `web_dist_dir` 改为：
+
+```yaml
+web_dist_dir: "/app/web/dist"
+log_file: "/app/logs/hostdeck.log"
 ```
 
-预期返回 `200 OK`，响应体包含：
-
-```json
-{"ok":true,"version":"0.1.0"}
-```
-
-默认访问地址：
-
-- 页面：`http://127.0.0.1:18080/`
-- 健康检查：`http://127.0.0.1:18080/api/healthz`
-
-## 关键说明
-
-- 这个项目不是前后端分离部署模式。日常运行时只需要启动 Go 后端，前端会以静态文件形式由后端直接托管。
-- 只有在首次启动，或前端代码发生改动后，才需要重新执行一次 `npm run build`。
-- 前端正式入口为 `/login`，未登录访问业务页面会被重定向到登录页。
-- 服务器 SSH 密码只在创建或编辑时提交，后端会加密存储，列表和详情接口都不会返回明文密码。
-- `viewer` 仅可查看，`admin` 与 `operator` 可执行采集、命令、规则修改等运维动作。
-- 如果 `master_key` 未配置，服务器密码无法安全保存，相关操作会直接报错。
-- 如需首次初始化管理员，可配置 `bootstrap_admin_username` 与 `bootstrap_admin_password`，或使用带 `X-HostDeck-Bootstrap-Token` 的 `/api/auth/bootstrap-admin` 接口。
-
-## 相关文档
-
-- [项目文档](./docs/项目文档.md)
-
-## 常用验证命令
+然后运行：
 
 ```powershell
-# 前端类型检查与构建
-Set-Location .\web
-npx vue-tsc --noEmit
+mkdir logs\hostdeck
+docker compose up -d --build
+```
+
+容器会读取挂载的 `./server/config/config.yaml`，并把应用日志写入 `./logs/hostdeck/hostdeck.log`；日志由 Go 程序按大小、数量和保留天数自动轮转。Linux 服务器上建议先执行 `sudo chown -R 10001:10001 logs/hostdeck`。更多部署细节见 [Docker 部署说明](./docs/docker-deployment.md)。
+
+## 验证
+
+```powershell
+# 后端测试
+cd server
+go test ./...
+
+# 前端构建
+cd ..\web
 npm run build
 
-# 后端测试
-Set-Location ..\server
-go test ./...
+# Compose 检查
+cd ..
+docker compose config
 ```
+
+## 注意事项
+
+- `master_key` 丢失后，已保存的 SSH 密码无法解密。
+- 生产环境建议使用 HTTPS，并设置 `session_cookie_secure: true`。
+- HostDeck 需要能访问被管理服务器的 SSH 端口。
+- 首次 SSH 测试会返回主机指纹，确认信任后后续连接会校验指纹。
+- `viewer` 只能查看；`admin` 和 `operator` 可执行运维动作。

@@ -7,6 +7,7 @@ import {
   NInput,
   NInputNumber,
   NModal,
+  NPopconfirm,
   NRadio,
   NRadioGroup,
   NScrollbar,
@@ -53,6 +54,7 @@ const historyExecutor = ref('')
 const historyTimeRange = ref<[number, number] | null>(null)
 const selectedHistory = ref<CommandHistoryRecord | null>(null)
 const showCreateTemplateModal = ref(false)
+const pendingRiskConfirmed = ref(false)
 const templateValues = reactive<Record<string, string>>({})
 const templateForm = reactive({
   name: '',
@@ -119,26 +121,56 @@ const selectedSummary = computed(() => {
   return `已选择 ${count} 个目标`
 })
 
+function hasDangerousRemoveCommand(value: string) {
+  return /\brm\s+(?=[^\n;&|]*-[a-z]*r)(?=[^\n;&|]*-[a-z]*f)[^\n;&|]*/i.test(value)
+}
+
+function hasHighRiskCommand(value: string) {
+  return (
+    hasDangerousRemoveCommand(value) ||
+    /\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b|\bmkfs(?:\.[a-z0-9]+)?\b|\bdd\s+.*\bof=\/dev\/|\bsystemctl\s+(?:stop|restart|disable)\b/i.test(value)
+  )
+}
+
+const isHighRiskCommand = computed(() => hasHighRiskCommand(resolvedCommand.value))
+const selectedExecutionRisk = computed(() => (selectedTemplate.value?.riskLevel === 'dangerous' || isHighRiskCommand.value ? 'dangerous' : 'normal'))
+const selectedExecutionSource = computed(() => (selectedTemplate.value ? 'template' : 'custom'))
+const requiresRiskConfirmation = computed(() => selectedExecutionRisk.value === 'dangerous' && !pendingRiskConfirmed.value)
+
 const historyColumns: DataTableColumns<CommandHistoryRecord> = [
   {
     title: '执行时间',
     key: 'executedAt',
-    render: (row) => h('span', { style: 'color: #d4d4d8' }, formatDateTime(row.executedAt)),
+    render: (row) => h('span', { style: 'color: #dce7f6' }, formatDateTime(row.executedAt)),
   },
   {
     title: '服务器',
     key: 'serverName',
-    render: (row) => h('strong', { style: 'color: #fff' }, row.serverName || `#${row.serverId}`),
+    render: (row) => h('strong', { style: 'color: #f3f7ff' }, row.serverName || `#${row.serverId}`),
   },
   {
     title: '执行人',
     key: 'executorUsername',
-    render: (row) => h('span', { style: 'color: #a1a1aa' }, row.executorUsername || '系统'),
+    render: (row) => h('span', { style: 'color: #aab8cd' }, row.executorUsername || '系统'),
   },
   {
     title: '命令',
     key: 'command',
-    render: (row) => h('code', { style: 'color: #d4d4d8; background: rgba(255,255,255,0.05); padding: 2px 6px; border-radius: 4px;' }, row.command),
+    render: (row) => h('code', { style: 'color: #dce7f6; background: rgba(17,32,52,0.64); padding: 2px 6px; border-radius: 4px;' }, row.command),
+  },
+  {
+    title: '风险',
+    key: 'riskLevel',
+    render: (row) =>
+      h(
+        NTag,
+        {
+          size: 'small',
+          bordered: false,
+          type: row.riskLevel === 'dangerous' ? 'warning' : 'info',
+        },
+        { default: () => (row.riskLevel === 'dangerous' ? (row.riskConfirmed ? '高风险已确认' : '高风险') : '普通') },
+      ),
   },
   {
     title: '结果',
@@ -157,7 +189,7 @@ const historyColumns: DataTableColumns<CommandHistoryRecord> = [
   {
     title: '耗时',
     key: 'durationMs',
-    render: (row) => h('span', { style: 'color: #a1a1aa' }, `${row.durationMs} ms`),
+    render: (row) => h('span', { style: 'color: #aab8cd' }, `${row.durationMs} ms`),
   },
   {
     title: '操作',
@@ -394,6 +426,10 @@ async function loadHistory() {
 }
 
 async function runCommand() {
+  if (requiresRiskConfirmation.value) {
+    message.warning('高风险命令需要二次确认')
+    return
+  }
   const missingVariables = missingTemplateVariables()
   if (missingVariables.length > 0) {
     message.warning(`请先填写模板变量：${missingVariables.map((item) => item.label).join('、')}`)
@@ -416,12 +452,15 @@ async function runCommand() {
   executing.value = true
   results.value = []
   try {
-    if (selectedTemplate.value?.riskLevel === 'dangerous') {
-      message.warning('当前为高风险模板，请确认业务影响后再执行')
+    const executionOptions = {
+      source: selectedExecutionSource.value,
+      templateId: selectedTemplate.value?.id,
+      riskLevel: selectedExecutionRisk.value,
+      riskConfirmed: pendingRiskConfirmed.value,
     }
     if (selectedServerIds.value.length === 1) {
       const serverId = selectedServerIds.value[0]
-      const result = await executeCommand(serverId, resolvedCommand.value, timeoutSeconds.value || 15)
+      const result = await executeCommand(serverId, resolvedCommand.value, timeoutSeconds.value || 15, executionOptions)
       const server = servers.value.find((item) => item.id === serverId)
       results.value = [
         {
@@ -432,9 +471,10 @@ async function runCommand() {
         },
       ]
     } else {
-      const response = await executeCommands(selectedServerIds.value, resolvedCommand.value, timeoutSeconds.value || 15)
+      const response = await executeCommands(selectedServerIds.value, resolvedCommand.value, timeoutSeconds.value || 15, executionOptions)
       results.value = response.results
     }
+    pendingRiskConfirmed.value = false
     const failedCount = results.value.filter((item) => !item.success).length
     if (failedCount === 0) {
       message.success('命令执行完成')
@@ -449,6 +489,11 @@ async function runCommand() {
   } finally {
     executing.value = false
   }
+}
+
+async function confirmRiskAndRun() {
+  pendingRiskConfirmed.value = true
+  await runCommand()
 }
 
 function resultStatus(result: BatchCommandResult) {
@@ -490,7 +535,6 @@ onMounted(async () => {
       <div class="page-header">
         <div class="header-text">
           <h1>远程终端</h1>
-          <p>在单个或多个目标服务器上安全地执行 Shell 命令及脚本，并查看历史记录。</p>
         </div>
       </div>
 
@@ -509,47 +553,6 @@ onMounted(async () => {
             />
           </div>
 
-          <div class="form-group">
-            <div class="section-title">
-              <label>命令模板</label>
-              <div class="template-toolbar">
-                <n-button ghost size="small" :disabled="!canManageInfrastructure" @click="openCreateTemplateModal">保存为模板</n-button>
-                <n-button
-                  v-if="selectedTemplate"
-                  ghost
-                  size="small"
-                  :disabled="!canManageInfrastructure"
-                  :loading="togglingFavorite"
-                  @click="toggleTemplateFavorite"
-                >
-                  {{ selectedTemplate.isFavorite ? '取消收藏' : '加入收藏' }}
-                </n-button>
-              </div>
-            </div>
-            <n-select
-              v-model:value="selectedTemplateId"
-              clearable
-              filterable
-              :options="templateOptions"
-              :loading="loadingTemplates"
-              placeholder="选择常用模板，或直接手输命令"
-              class="dark-input"
-            />
-            <div v-if="selectedTemplate" class="template-meta">
-              <div class="template-meta__head">
-                <strong>{{ selectedTemplate.name }}</strong>
-                <div class="template-badges">
-                  <n-tag v-if="selectedTemplate.isFavorite" type="warning" size="small" :bordered="false">收藏</n-tag>
-                  <n-tag size="small" :bordered="false">{{ templateScopeLabel(selectedTemplate) }}</n-tag>
-                  <n-tag :type="selectedTemplate.riskLevel === 'dangerous' ? 'warning' : 'success'" size="small" :bordered="false">
-                    {{ templateRiskLabel(selectedTemplate) }}
-                  </n-tag>
-                </div>
-              </div>
-              <p>{{ selectedTemplate.description || '暂无模板描述' }}</p>
-            </div>
-          </div>
-
           <div v-if="selectedTemplate && selectedTemplate.variables.length > 0" class="template-vars">
             <div v-for="variable in selectedTemplate.variables" :key="variable.name" class="form-group">
               <label>{{ variable.label }}</label>
@@ -561,7 +564,7 @@ onMounted(async () => {
             </div>
           </div>
 
-          <div class="form-group">
+          <div class="form-group command-block">
             <label>执行命令</label>
             <n-input
               v-model:value="command"
@@ -574,27 +577,99 @@ onMounted(async () => {
               <span>最终命令预览</span>
               <code>{{ resolvedCommand }}</code>
             </div>
-          </div>
 
-          <div class="form-group" style="width: 140px;">
-            <label>超时时间 (秒)</label>
-            <n-input-number v-model:value="timeoutSeconds" :min="1" :max="60" class="dark-input" />
-          </div>
+            <div class="execution-row">
+              <div class="timeout-field">
+                <label>超时 (秒)</label>
+                <n-input-number v-model:value="timeoutSeconds" :min="1" :max="60" class="dark-input" />
+              </div>
 
-          <div class="action-bar">
-            <n-button v-if="canManageInfrastructure" type="primary" size="large" class="glow-btn" :loading="executing" @click="runCommand">
-              {{ selectedServerIds.length > 1 ? '批量执行命令' : '执行命令' }}
-            </n-button>
-            <n-button v-else disabled size="large" class="glow-btn">
-              只读账号不可执行命令
-            </n-button>
+              <div class="action-bar">
+                <n-popconfirm v-if="canManageInfrastructure && requiresRiskConfirmation" @positive-click="confirmRiskAndRun">
+                  <template #trigger>
+                    <n-button type="warning" size="large" class="glow-btn" :loading="executing">
+                      {{ selectedServerIds.length > 1 ? '确认高风险批量执行' : '确认高风险执行' }}
+                    </n-button>
+                  </template>
+                  高风险命令可能中断服务或修改系统状态，确认继续执行？
+                </n-popconfirm>
+                <n-button v-else-if="canManageInfrastructure" type="primary" size="large" class="glow-btn" :loading="executing" @click="runCommand">
+                  {{ selectedServerIds.length > 1 ? '批量执行命令' : '执行命令' }}
+                </n-button>
+                <n-button v-else disabled size="large" class="glow-btn">
+                  只读账号不可执行命令
+                </n-button>
+              </div>
+            </div>
           </div>
         </div>
+
+        <aside class="template-panel">
+          <div class="results-header">
+            <h3>命令模板</h3>
+            <n-button ghost size="small" :disabled="!canManageInfrastructure" @click="openCreateTemplateModal">新增</n-button>
+          </div>
+          <n-select
+            v-model:value="selectedTemplateId"
+            clearable
+            filterable
+            :options="templateOptions"
+            :loading="loadingTemplates"
+            placeholder="搜索模板名称或描述"
+            class="dark-input"
+          />
+          <div v-if="selectedTemplate" class="template-meta">
+            <div class="template-meta__head">
+              <strong>{{ selectedTemplate.name }}</strong>
+              <div class="template-badges">
+                <n-tag v-if="selectedTemplate.isFavorite" type="warning" size="small" :bordered="false">收藏</n-tag>
+                <n-tag size="small" :bordered="false">{{ templateScopeLabel(selectedTemplate) }}</n-tag>
+                <n-tag :type="selectedTemplate.riskLevel === 'dangerous' ? 'warning' : 'info'" size="small" :bordered="false">
+                  {{ templateRiskLabel(selectedTemplate) }}
+                </n-tag>
+              </div>
+            </div>
+            <p>{{ selectedTemplate.description || '暂无模板描述' }}</p>
+            <code>{{ selectedTemplate.command }}</code>
+            <div class="template-toolbar">
+              <n-button
+                ghost
+                size="small"
+                :disabled="!canManageInfrastructure"
+                :loading="togglingFavorite"
+                @click="toggleTemplateFavorite"
+              >
+                {{ selectedTemplate.isFavorite ? '取消收藏' : '加入收藏' }}
+              </n-button>
+              <n-button ghost size="small" :disabled="!canManageInfrastructure" @click="openCreateTemplateModal">另存为模板</n-button>
+            </div>
+          </div>
+          <div v-else-if="templates.length" class="template-list">
+            <button
+              v-for="template in templates.slice(0, 4)"
+              :key="template.id"
+              type="button"
+              class="template-row"
+              @click="selectedTemplateId = template.id"
+            >
+              <span>
+                <strong>{{ template.name }}</strong>
+                <small>{{ template.command }}</small>
+              </span>
+              <n-tag size="small" :type="template.riskLevel === 'dangerous' ? 'warning' : 'info'" :bordered="false">
+                {{ template.riskLevel === 'dangerous' ? '服务治理' : '系统检查' }}
+              </n-tag>
+            </button>
+          </div>
+          <div v-else class="template-empty">
+            暂无命令模板
+          </div>
+        </aside>
 
         <div class="results-panel">
           <div class="results-header">
             <h3>执行结果</h3>
-            <n-tag type="info" size="small" bordered style="background: transparent; color: #a1a1aa; border-color: rgba(255,255,255,0.1)">
+            <n-tag type="info" size="small" bordered style="background: transparent; color: var(--app-text-soft); border-color: rgba(93,120,162,0.22)">
               {{ selectedSummary }}
             </n-tag>
           </div>
@@ -626,17 +701,15 @@ onMounted(async () => {
               </div>
             </div>
             <div v-else class="empty-terminal">
-              <div class="empty-prompt">
-                <span class="cursor">_</span>
-                <p>等待命令执行...</p>
-              </div>
+              <span class="cursor" aria-hidden="true" />
             </div>
           </n-spin>
+        </div>
 
           <div class="history-card">
             <div class="results-header">
               <h3>命令历史</h3>
-              <n-button ghost size="small" @click="loadHistory" :loading="loadingHistory" style="color: #a1a1aa; border-color: rgba(255,255,255,0.1)">
+              <n-button ghost size="small" @click="loadHistory" :loading="loadingHistory" style="color: var(--app-text-soft); border-color: rgba(93,120,162,0.22)">
                 刷新历史
               </n-button>
             </div>
@@ -675,12 +748,14 @@ onMounted(async () => {
             <div v-if="selectedHistory" class="history-detail">
               <div class="results-header">
                 <h3>历史详情</h3>
-                <n-button text @click="selectedHistory = null" style="color: #a1a1aa">关闭</n-button>
+                <n-button text @click="selectedHistory = null" style="color: var(--app-text-soft)">关闭</n-button>
               </div>
               <div class="result-details detail-stack">
                 <div class="detail-row"><span>执行时间:</span><span>{{ formatDateTime(selectedHistory.executedAt) }}</span></div>
                 <div class="detail-row"><span>服务器:</span><span>{{ selectedHistory.serverName || `#${selectedHistory.serverId}` }}</span></div>
                 <div class="detail-row"><span>执行人:</span><span>{{ selectedHistory.executorUsername || '系统' }}</span></div>
+                <div class="detail-row"><span>来源:</span><span>{{ selectedHistory.source === 'template' ? '命令模板' : '自定义命令' }}</span></div>
+                <div class="detail-row"><span>风险:</span><span>{{ selectedHistory.riskLevel === 'dangerous' ? (selectedHistory.riskConfirmed ? '高风险已确认' : '高风险未确认') : '普通' }}</span></div>
                 <div class="detail-row"><span>命令:</span><code>{{ selectedHistory.command }}</code></div>
               </div>
               <div class="terminal-output">
@@ -691,7 +766,6 @@ onMounted(async () => {
 
             <n-empty v-if="!loadingHistory && historyItems.length === 0" description="暂无命令历史" style="padding: 32px 0" />
           </div>
-        </div>
       </div>
     </div>
 
@@ -748,50 +822,51 @@ onMounted(async () => {
 }
 
 .page-container {
-  padding: 32px;
-  max-width: 1600px;
-  margin: 0 auto;
+  max-width: 100%;
+  margin: 0;
 }
 
 .page-header {
-  margin-bottom: 32px;
+  margin-bottom: 18px;
 }
 
 .header-text h1 {
-  font-size: 32px;
-  font-weight: 600;
-  margin: 0 0 8px 0;
-  color: #fff;
-  letter-spacing: -0.5px;
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0;
+  color: var(--app-text);
+  letter-spacing: 0;
 }
 
 .header-text p {
   margin: 0;
-  color: #a1a1aa;
+  color: var(--app-text-soft);
   font-size: 16px;
 }
 
 .layout-grid {
   display: grid;
-  grid-template-columns: minmax(360px, 420px) minmax(0, 1fr);
-  gap: 24px;
+  grid-template-columns: minmax(430px, 1.05fr) minmax(280px, 0.62fr) minmax(360px, 0.9fr);
+  gap: 14px;
 }
 
-.control-panel {
-  background: rgba(20, 20, 25, 0.6);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 20px;
-  padding: 24px;
+.control-panel,
+.template-panel {
+  background: var(--app-panel);
+  border: 1px solid rgba(93, 120, 162, 0.22);
+  border-radius: 8px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 14px;
+  align-self: start;
 }
 
 .form-group label {
   display: block;
   font-size: 13px;
   font-weight: 500;
-  color: #d4d4d8;
+  color: var(--app-text);
   margin-bottom: 8px;
 }
 
@@ -816,9 +891,9 @@ onMounted(async () => {
 .template-meta {
   margin-top: 10px;
   padding: 12px;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(17, 32, 52, 0.46);
+  border: 1px solid rgba(93, 120, 162, 0.14);
 }
 
 .template-meta__head {
@@ -836,13 +911,89 @@ onMounted(async () => {
 }
 
 .template-meta strong {
-  color: #fff;
+  color: var(--app-text);
 }
 
 .template-meta p {
   margin: 8px 0 0;
-  color: #a1a1aa;
+  color: var(--app-text-soft);
   font-size: 13px;
+}
+
+.template-meta code {
+  display: block;
+  margin-top: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(93, 120, 162, 0.16);
+  background: rgba(0, 7, 16, 0.48);
+  color: #dce7f6;
+  font-family: var(--app-font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.template-empty {
+  min-height: 170px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed rgba(93, 120, 162, 0.22);
+  border-radius: 8px;
+  color: var(--app-text-faint);
+  font-size: 13px;
+}
+
+.template-list {
+  display: grid;
+  gap: 10px;
+}
+
+.template-row {
+  width: 100%;
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(93, 120, 162, 0.16);
+  border-radius: 8px;
+  background: rgba(17, 32, 52, 0.42);
+  color: var(--app-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.template-row:hover {
+  border-color: rgba(79, 131, 255, 0.42);
+  background: rgba(79, 131, 255, 0.1);
+}
+
+.template-row span {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.template-row strong,
+.template-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-row strong {
+  color: var(--app-text);
+  font-size: 13px;
+}
+
+.template-row small {
+  color: var(--app-text-soft);
+  font-family: var(--app-font-mono);
+  font-size: 12px;
 }
 
 .template-vars {
@@ -857,64 +1008,93 @@ onMounted(async () => {
 }
 
 .resolved-command span {
-  color: #a1a1aa;
+  color: var(--app-text-soft);
   font-size: 12px;
 }
 
 .resolved-command code {
-  color: #d4d4d8;
-  background: rgba(255,255,255,0.05);
+  color: #dce7f6;
+  background: rgba(17, 32, 52, 0.64);
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: 8px;
   white-space: pre-wrap;
   word-break: break-all;
 }
 
 .action-bar {
   display: flex;
-  margin-top: auto;
+  min-width: 180px;
+  flex: 1;
+}
+
+.command-block {
+  display: grid;
+  gap: 12px;
+}
+
+.execution-row {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  padding-top: 2px;
+}
+
+.timeout-field {
+  width: 132px;
+  flex-shrink: 0;
+}
+
+.timeout-field label {
+  margin-bottom: 8px;
 }
 
 .glow-btn {
-  box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
-  transition: all 0.3s ease;
-  background-color: #10b981 !important;
+  box-shadow: none;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+  background-color: var(--app-accent-strong) !important;
   color: #fff !important;
   border: none;
   flex: 1;
 }
 
 .glow-btn:hover:not(:disabled) {
-  box-shadow: 0 0 30px rgba(16, 185, 129, 0.6);
-  transform: translateY(-1px);
+  box-shadow: none;
+  background-color: #2f72ff !important;
+  transform: none;
 }
 
 .glow-btn:disabled {
-  background-color: rgba(255,255,255,0.1) !important;
+  background-color: rgba(93, 120, 162, 0.14) !important;
   box-shadow: none;
-  color: #a1a1aa !important;
+  color: var(--app-text-soft) !important;
   cursor: not-allowed;
 }
 
 :deep(.dark-input .n-input__border),
 :deep(.dark-input .n-base-selection__border) {
-  border-color: rgba(255, 255, 255, 0.1);
+  border-color: rgba(93, 120, 162, 0.24);
 }
 
 :deep(.dark-input .n-input__placeholder),
 :deep(.dark-input .n-base-selection-placeholder) {
-  color: #71717a;
+  color: var(--app-text-faint);
 }
 
 :deep(.code-input .n-input__textarea-el) {
   font-family: 'Fira Code', 'Courier New', Courier, monospace !important;
-  color: #6ee7b7 !important;
+  color: var(--app-accent) !important;
 }
 
 .results-panel {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
+  min-width: 0;
+  min-height: 354px;
+  padding: 16px;
+  border: 1px solid rgba(93, 120, 162, 0.22);
+  border-radius: 8px;
+  background: var(--app-panel);
 }
 
 .results-header {
@@ -927,21 +1107,22 @@ onMounted(async () => {
   margin: 0;
   font-size: 18px;
   font-weight: 600;
-  color: #fff;
+  color: var(--app-text);
 }
 
 .results-list,
 .history-card {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 
 .history-card {
-  background: rgba(20, 20, 25, 0.6);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 20px;
-  padding: 20px;
+  grid-column: 1 / -1;
+  background: var(--app-panel);
+  border: 1px solid rgba(93, 120, 162, 0.22);
+  border-radius: 8px;
+  padding: 16px;
 }
 
 .history-filters {
@@ -971,9 +1152,9 @@ onMounted(async () => {
 
 .result-card,
 .history-detail {
-  background: rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 16px;
+  background: rgba(7, 17, 31, 0.48);
+  border: 1px solid rgba(93, 120, 162, 0.18);
+  border-radius: 8px;
   overflow: hidden;
 }
 
@@ -982,14 +1163,14 @@ onMounted(async () => {
   justify-content: space-between;
   align-items: center;
   padding: 14px 20px;
-  background: rgba(255, 255, 255, 0.02);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(17, 32, 52, 0.52);
+  border-bottom: 1px solid rgba(93, 120, 162, 0.12);
 }
 
 .server-name {
   font-size: 15px;
   font-weight: 600;
-  color: #fff;
+  color: var(--app-text);
 }
 
 .status-badge {
@@ -999,17 +1180,17 @@ onMounted(async () => {
   border-radius: 4px;
 }
 
-.status-badge.success { color: #10b981; background: rgba(16, 185, 129, 0.1); }
-.status-badge.error { color: #f43f5e; background: rgba(244, 63, 94, 0.1); }
-.status-badge.warning { color: #f59e0b; background: rgba(245, 158, 11, 0.1); }
+.status-badge.success { color: #35d6a3; background: rgba(53, 214, 163, 0.1); }
+.status-badge.error { color: var(--app-danger); background: rgba(255, 107, 125, 0.1); }
+.status-badge.warning { color: var(--app-warning); background: rgba(232, 180, 95, 0.1); }
 
 .result-details {
   padding: 12px 20px;
   display: flex;
   gap: 24px;
   font-size: 12px;
-  color: #a1a1aa;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+  color: var(--app-text-soft);
+  border-bottom: 1px solid rgba(93, 120, 162, 0.1);
 }
 
 .detail-stack {
@@ -1024,9 +1205,9 @@ onMounted(async () => {
 }
 
 .detail-row code {
-  color: #d4d4d8;
+  color: #dce7f6;
   font-family: 'Fira Code', monospace;
-  background: rgba(255,255,255,0.05);
+  background: rgba(17,32,52,0.64);
   padding: 2px 6px;
   border-radius: 4px;
 }
@@ -1036,8 +1217,8 @@ onMounted(async () => {
   font-family: 'Fira Code', 'Courier New', Courier, monospace;
   font-size: 13px;
   line-height: 1.6;
-  color: #d4d4d8;
-  background: #000;
+  color: #dce7f6;
+  background: rgba(0, 7, 16, 0.9);
   overflow-x: auto;
 }
 
@@ -1053,45 +1234,35 @@ onMounted(async () => {
 
 .empty-terminal {
   min-height: 220px;
-  background: rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 16px;
+  background: rgba(7, 17, 31, 0.48);
+  border: 1px solid rgba(93, 120, 162, 0.18);
+  border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.empty-prompt {
-  text-align: center;
-  color: #52525b;
-  font-family: 'Fira Code', monospace;
-}
-
-.empty-prompt p {
-  margin: 12px 0 0 0;
-  font-size: 14px;
-}
-
 .cursor {
   display: inline-block;
-  width: 12px;
-  height: 24px;
-  background: #52525b;
+  width: 8px;
+  height: 16px;
+  border-radius: 2px;
+  background: rgba(32, 212, 255, 0.62);
   animation: blink 1s step-end infinite;
 }
 
 :deep(.dark-table .n-data-table-th) {
-  background: rgba(255,255,255,0.02);
-  color: #a1a1aa;
+  background: rgba(17,32,52,0.52);
+  color: var(--app-text-soft);
 }
 
 :deep(.dark-table .n-data-table-td) {
   background: transparent;
-  color: #d4d4d8;
+  color: #dce7f6;
 }
 
 :deep(.dark-table .n-data-table-tr:hover .n-data-table-td) {
-  background: rgba(255,255,255,0.02);
+  background: rgba(79, 131, 255, 0.08);
 }
 
 @keyframes blink {
@@ -1099,7 +1270,20 @@ onMounted(async () => {
   50% { opacity: 0; }
 }
 
-@media (max-width: 1200px) {
+@media (max-width: 1500px) {
+  .layout-grid {
+    grid-template-columns: minmax(420px, 1fr) minmax(320px, 0.8fr);
+  }
+
+  .template-panel {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .results-panel {
+    grid-column: 1 / -1;
+  }
+
   .history-filters {
     grid-template-columns: 1fr 1fr;
   }
@@ -1112,6 +1296,16 @@ onMounted(async () => {
 
   .history-filters {
     grid-template-columns: 1fr;
+  }
+
+  .execution-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .timeout-field,
+  .action-bar {
+    width: 100%;
   }
 }
 </style>

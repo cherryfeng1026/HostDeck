@@ -2,7 +2,7 @@
   <defs>
     <linearGradient id="hostdeck-grad-favicon" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#2dd4bf" />
-      <stop offset="100%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#20d4ff" />
     </linearGradient>
   </defs>
   <path d="M12 3 L 6 13 H 18 Z" />

@@ -16,6 +16,7 @@ import (
 	"hostdeck/server/internal/config"
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/httpx"
+	applog "hostdeck/server/internal/logging"
 	"hostdeck/server/internal/scheduler"
 	"hostdeck/server/internal/service"
 	"hostdeck/server/internal/sshx"
@@ -34,6 +35,21 @@ func main() {
 		slog.Error("load config failed", "error", err)
 		os.Exit(1)
 	}
+	closeLog, err := applog.Configure(applog.Config{
+		File:       cfg.LogFile,
+		Level:      cfg.LogLevel,
+		MaxSizeMB:  cfg.LogMaxSizeMB,
+		MaxBackups: cfg.LogMaxBackups,
+		MaxAgeDays: cfg.LogMaxAgeDays,
+		Compress:   cfg.LogCompress,
+	})
+	if err != nil {
+		slog.Error("configure logging failed", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		_ = closeLog()
+	}()
 
 	db, err := storage.Open(ctx, cfg.DBDSN)
 	if err != nil {
@@ -68,7 +84,7 @@ func main() {
 		slog.Error("bootstrap admin failed", "error", err)
 		os.Exit(1)
 	}
-	alertNotifier := service.NewDynamicWebhookAlertNotifier(alertRepo)
+	alertNotifier := service.NewDynamicWebhookAlertNotifier(alertRepo, alertRepo)
 	alertService := service.NewAlertService(alertRepo, alertRepo, serverRepo, alertRepo, alertNotifier)
 	currentNotificationSettings, err := alertService.GetNotificationSettings(ctx)
 	if err != nil {
@@ -144,6 +160,7 @@ func main() {
 		"starting server",
 		"addr", cfg.HTTPAddr,
 		"webDistDir", cfg.WebDistDir,
+		"logFile", cfg.LogFile,
 		"sessionCookieName", cfg.SessionCookieName,
 	)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

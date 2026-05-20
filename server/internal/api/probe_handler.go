@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -96,6 +95,13 @@ func (h *ProbeHandler) TestSSH(w http.ResponseWriter, r *http.Request) {
 	response["trustedHostKeyFingerprint"] = server.TrustedHostKeyFingerprint
 	if runErr != nil {
 		response["error"] = runErr.Error()
+		var trustRequired sshx.HostKeyTrustRequiredError
+		if errors.As(runErr, &trustRequired) {
+			response["trustRequired"] = true
+			response["hostKeyFingerprint"] = trustRequired.Actual
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
 		var mismatch sshx.HostKeyMismatchError
 		if errors.As(runErr, &mismatch) {
 			response["fingerprintMismatch"] = true
@@ -118,11 +124,8 @@ func (h *ProbeHandler) TrustHostKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	defer r.Body.Close()
-	var payload trustHostKeyPayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
+	payload, err := decodeJSON[trustHostKeyPayload](w, r)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -150,6 +153,16 @@ func (h *ProbeHandler) ProbeNow(w http.ResponseWriter, r *http.Request) {
 
 	snapshot, err := collector.NewSSHCollector(h.runner).Collect(r.Context(), server)
 	if err != nil {
+		var trustRequired sshx.HostKeyTrustRequiredError
+		if errors.As(err, &trustRequired) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		var mismatch sshx.HostKeyMismatchError
+		if errors.As(err, &mismatch) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
@@ -184,6 +197,7 @@ func sshTargetFromServer(server domain.Server) sshx.Target {
 		Port:                      server.SSHPort,
 		Username:                  server.Username,
 		Password:                  server.Password,
+		PrivateKeyPEM:             server.PrivateKey,
 		TrustedHostKeyFingerprint: server.TrustedHostKeyFingerprint,
 	}
 }
@@ -197,7 +211,7 @@ func writeProbeResolveError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	if errors.Is(err, service.ErrServerPasswordNotConfigured) {
+	if errors.Is(err, service.ErrServerCredentialNotConfigured) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}

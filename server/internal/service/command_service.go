@@ -26,17 +26,22 @@ type CommandLogStore interface {
 type CommandTemplateStore interface {
 	EnsureDefaults(ctx context.Context, items []domain.CommandTemplate) error
 	List(ctx context.Context, filter domain.CommandTemplateFilter) ([]domain.CommandTemplate, error)
+	GetByID(ctx context.Context, templateID string, username string) (domain.CommandTemplate, error)
 	Create(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error)
 	SetFavorite(ctx context.Context, templateID string, username string, favorite bool) error
 }
 
 type CommandResult struct {
-	Command    string    `json:"command"`
-	Stdout     string    `json:"stdout"`
-	Stderr     string    `json:"stderr"`
-	ExitCode   int       `json:"exitCode"`
-	DurationMS int64     `json:"durationMs"`
-	ExecutedAt time.Time `json:"executedAt"`
+	Command       string    `json:"command"`
+	Stdout        string    `json:"stdout"`
+	Stderr        string    `json:"stderr"`
+	ExitCode      int       `json:"exitCode"`
+	DurationMS    int64     `json:"durationMs"`
+	ExecutedAt    time.Time `json:"executedAt"`
+	Source        string    `json:"source"`
+	TemplateID    string    `json:"templateId,omitempty"`
+	RiskLevel     string    `json:"riskLevel"`
+	RiskConfirmed bool      `json:"riskConfirmed"`
 }
 
 type BatchCommandResult struct {
@@ -45,6 +50,21 @@ type BatchCommandResult struct {
 	Success    bool          `json:"success"`
 	Result     CommandResult `json:"result"`
 	Error      string        `json:"error,omitempty"`
+}
+
+var ErrCommandRiskConfirmationRequired = errors.New("高风险命令需要二次确认")
+var ErrCommandTemplateMismatch = errors.New("命令与模板不匹配")
+
+type CommandExecutionError struct {
+	Err error
+}
+
+func (e CommandExecutionError) Error() string {
+	return e.Err.Error()
+}
+
+func (e CommandExecutionError) Unwrap() error {
+	return e.Err
 }
 
 type CommandService struct {
@@ -68,17 +88,28 @@ func (s *CommandService) Execute(ctx context.Context, serverID int64, command st
 }
 
 func (s *CommandService) ExecuteWithExecutor(ctx context.Context, serverID int64, command string, timeout time.Duration, executorUsername string) (CommandResult, error) {
-	command = strings.TrimSpace(command)
-	if command == "" {
+	return s.ExecuteCommand(ctx, domain.CommandExecutionInput{
+		ServerID:         serverID,
+		Command:          command,
+		Timeout:          timeout,
+		ExecutorUsername: executorUsername,
+	})
+}
+
+func (s *CommandService) ExecuteCommand(ctx context.Context, input domain.CommandExecutionInput) (CommandResult, error) {
+	input.Command = strings.TrimSpace(input.Command)
+	if input.Command == "" {
 		return CommandResult{}, errors.New("命令不能为空")
 	}
-
-	server, err := s.servers.ResolveServer(ctx, serverID)
+	server, err := s.servers.ResolveServer(ctx, input.ServerID)
 	if err != nil {
 		return CommandResult{}, err
 	}
-
-	return s.executeOnServer(ctx, server, command, timeout, executorUsername)
+	input, err = s.normalizeExecutionInput(ctx, input)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	return s.executeOnServer(ctx, server, input)
 }
 
 func (s *CommandService) ExecuteBatch(ctx context.Context, serverIDs []int64, command string, timeout time.Duration) ([]BatchCommandResult, error) {
@@ -86,17 +117,31 @@ func (s *CommandService) ExecuteBatch(ctx context.Context, serverIDs []int64, co
 }
 
 func (s *CommandService) ExecuteBatchWithExecutor(ctx context.Context, serverIDs []int64, command string, timeout time.Duration, executorUsername string) ([]BatchCommandResult, error) {
-	command = strings.TrimSpace(command)
-	if command == "" {
+	return s.ExecuteBatchWithInput(ctx, domain.CommandExecutionInput{
+		ServerIDs:        serverIDs,
+		Command:          command,
+		Timeout:          timeout,
+		ExecutorUsername: executorUsername,
+	})
+}
+
+func (s *CommandService) ExecuteBatchWithInput(ctx context.Context, input domain.CommandExecutionInput) ([]BatchCommandResult, error) {
+	input.Command = strings.TrimSpace(input.Command)
+	if input.Command == "" {
 		return nil, errors.New("命令不能为空")
 	}
 
-	ids := normalizeServerIDs(serverIDs)
+	ids := normalizeServerIDs(input.ServerIDs)
 	if len(ids) == 0 {
 		return nil, errors.New("目标服务器不能为空")
 	}
 	if len(ids) > 20 {
 		return nil, errors.New("目标服务器数量不能超过 20 台")
+	}
+	var err error
+	input, err = s.normalizeExecutionInput(ctx, input)
+	if err != nil {
+		return nil, err
 	}
 
 	results := make([]BatchCommandResult, len(ids))
@@ -120,7 +165,7 @@ func (s *CommandService) ExecuteBatchWithExecutor(ctx context.Context, serverIDs
 				return
 			}
 
-			result, execErr := s.executeOnServer(ctx, server, command, timeout, executorUsername)
+			result, execErr := s.executeOnServer(ctx, server, input)
 			results[index] = BatchCommandResult{
 				ServerID:   id,
 				ServerName: server.Name,
@@ -141,11 +186,47 @@ func (s *CommandService) ListHistory(ctx context.Context, filter domain.CommandH
 	return s.logs.ListHistory(ctx, filter)
 }
 
-func (s *CommandService) executeOnServer(ctx context.Context, server domain.Server, command string, timeout time.Duration, executorUsername string) (CommandResult, error) {
+func (s *CommandService) normalizeExecutionInput(ctx context.Context, input domain.CommandExecutionInput) (domain.CommandExecutionInput, error) {
+	input.Source = strings.TrimSpace(input.Source)
+	if input.Source == "" {
+		input.Source = domain.CommandSourceCustom
+	}
+	input.TemplateID = strings.TrimSpace(input.TemplateID)
+	input.RiskLevel = strings.TrimSpace(input.RiskLevel)
+	if input.TemplateID != "" && s.templates != nil {
+		template, err := s.templates.GetByID(ctx, input.TemplateID, input.ExecutorUsername)
+		if err != nil {
+			return domain.CommandExecutionInput{}, err
+		}
+		if !commandMatchesTemplate(input.Command, template.Command) {
+			return domain.CommandExecutionInput{}, ErrCommandTemplateMismatch
+		}
+		input.Source = domain.CommandSourceTemplate
+		input.RiskLevel = template.RiskLevel
+	}
+	if input.RiskLevel == "" {
+		input.RiskLevel = domain.CommandTemplateRiskNormal
+	}
+	if input.RiskLevel == domain.CommandTemplateRiskNormal && looksDangerousCommand(input.Command) {
+		input.RiskLevel = domain.CommandTemplateRiskDangerous
+	}
+	if input.RiskLevel != domain.CommandTemplateRiskNormal && input.RiskLevel != domain.CommandTemplateRiskDangerous {
+		return domain.CommandExecutionInput{}, errors.New("命令风险级别无效")
+	}
+	if input.RiskLevel == domain.CommandTemplateRiskDangerous && !input.RiskConfirmed {
+		return domain.CommandExecutionInput{}, ErrCommandRiskConfirmationRequired
+	}
+	input.ExecutorUsername = strings.TrimSpace(input.ExecutorUsername)
+	input.ExecutorAuthMethod = strings.TrimSpace(input.ExecutorAuthMethod)
+	input.RequestID = strings.TrimSpace(input.RequestID)
+	return input, nil
+}
+
+func (s *CommandService) executeOnServer(ctx context.Context, server domain.Server, input domain.CommandExecutionInput) (CommandResult, error) {
 	runCtx := ctx
-	if timeout > 0 {
+	if input.Timeout > 0 {
 		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
+		runCtx, cancel = context.WithTimeout(ctx, input.Timeout)
 		defer cancel()
 	}
 
@@ -155,32 +236,51 @@ func (s *CommandService) executeOnServer(ctx context.Context, server domain.Serv
 		Port:                      server.SSHPort,
 		Username:                  server.Username,
 		Password:                  server.Password,
+		PrivateKeyPEM:             server.PrivateKey,
 		TrustedHostKeyFingerprint: server.TrustedHostKeyFingerprint,
-		Timeout:                   timeout,
-	}, command)
+		Timeout:                   input.Timeout,
+	}, input.Command)
 	if err != nil {
-		return CommandResult{}, err
+		exitCode = -1
+		if strings.TrimSpace(stderr) == "" {
+			stderr = err.Error()
+		}
 	}
 
 	result := CommandResult{
-		Command:    command,
-		Stdout:     sanitizeCommandOutput(stdout),
-		Stderr:     sanitizeCommandOutput(stderr),
-		ExitCode:   exitCode,
-		DurationMS: time.Since(startedAt).Milliseconds(),
-		ExecutedAt: time.Now(),
+		Command:       sanitizeCommandText(input.Command),
+		Stdout:        sanitizeCommandOutput(stdout),
+		Stderr:        sanitizeCommandOutput(stderr),
+		ExitCode:      exitCode,
+		DurationMS:    time.Since(startedAt).Milliseconds(),
+		ExecutedAt:    time.Now(),
+		Source:        input.Source,
+		TemplateID:    input.TemplateID,
+		RiskLevel:     input.RiskLevel,
+		RiskConfirmed: input.RiskConfirmed,
 	}
 	if err := s.logs.Create(ctx, domain.CommandLog{
-		ServerID:         server.ID,
-		ExecutorUsername: strings.TrimSpace(executorUsername),
-		Command:          result.Command,
-		Stdout:           result.Stdout,
-		Stderr:           result.Stderr,
-		ExitCode:         result.ExitCode,
-		DurationMS:       result.DurationMS,
-		ExecutedAt:       result.ExecutedAt,
+		ServerID:           server.ID,
+		ServerName:         server.Name,
+		ServerIP:           server.IP,
+		ExecutorUsername:   input.ExecutorUsername,
+		ExecutorAuthMethod: input.ExecutorAuthMethod,
+		Command:            result.Command,
+		Stdout:             result.Stdout,
+		Stderr:             result.Stderr,
+		ExitCode:           result.ExitCode,
+		DurationMS:         result.DurationMS,
+		ExecutedAt:         result.ExecutedAt,
+		Source:             result.Source,
+		TemplateID:         result.TemplateID,
+		RiskLevel:          result.RiskLevel,
+		RiskConfirmed:      result.RiskConfirmed,
+		RequestID:          input.RequestID,
 	}); err != nil {
 		return CommandResult{}, err
+	}
+	if err != nil {
+		return result, CommandExecutionError{Err: err}
 	}
 
 	return result, nil
@@ -239,6 +339,7 @@ func normalizeServerIDs(serverIDs []int64) []int64 {
 }
 
 const maxCommandOutputLength = 16 * 1024
+const maxCommandTextLength = 4 * 1024
 
 var redactionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?im)((?:password|passwd|pwd)\s*[:=]\s*)([^\s]+)`),
@@ -246,14 +347,72 @@ var redactionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?im)(authorization\s*:\s*(?:bearer|basic)\s+)([^\s]+)`),
 }
 
+var dangerousRemoveCommandPattern = regexp.MustCompile(`(?i)\brm\s+([^\n;&|]*)`)
+
+var dangerousCommandPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b`),
+	regexp.MustCompile(`(?i)\bmkfs(?:\.[a-z0-9]+)?\b`),
+	regexp.MustCompile(`(?i)\bdd\s+.*\bof=/dev/`),
+	regexp.MustCompile(`(?i)\bsystemctl\s+(?:stop|restart|disable)\b`),
+}
+
+func looksDangerousCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if looksDangerousRemoveCommand(command) {
+		return true
+	}
+	for _, pattern := range dangerousCommandPatterns {
+		if pattern.MatchString(command) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksDangerousRemoveCommand(command string) bool {
+	for _, match := range dangerousRemoveCommandPattern.FindAllStringSubmatch(command, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		hasRecursive := false
+		hasForce := false
+		for _, field := range strings.Fields(match[1]) {
+			normalized := strings.ToLower(field)
+			if normalized == "--" {
+				break
+			}
+			switch normalized {
+			case "--recursive":
+				hasRecursive = true
+				continue
+			case "--force":
+				hasForce = true
+				continue
+			}
+			if !strings.HasPrefix(normalized, "-") || strings.HasPrefix(normalized, "--") {
+				continue
+			}
+			flags := strings.TrimLeft(normalized, "-")
+			if strings.Contains(flags, "r") {
+				hasRecursive = true
+			}
+			if strings.Contains(flags, "f") {
+				hasForce = true
+			}
+		}
+		if hasRecursive && hasForce {
+			return true
+		}
+	}
+	return false
+}
+
 func sanitizeCommandOutput(value string) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return ""
 	}
-	for _, pattern := range redactionPatterns {
-		trimmed = pattern.ReplaceAllString(trimmed, `${1}[REDACTED]`)
-	}
+	trimmed = redactSensitiveText(trimmed)
 	if len(trimmed) <= maxCommandOutputLength {
 		return trimmed
 	}
@@ -261,7 +420,57 @@ func sanitizeCommandOutput(value string) string {
 	return fmt.Sprintf("%s\n...[输出已截断，省略 %d 字符]", trimmed[:maxCommandOutputLength], remaining)
 }
 
+func sanitizeCommandText(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = redactSensitiveText(trimmed)
+	if len(trimmed) <= maxCommandTextLength {
+		return trimmed
+	}
+	remaining := len(trimmed) - maxCommandTextLength
+	return fmt.Sprintf("%s\n...[命令已截断，省略 %d 字符]", trimmed[:maxCommandTextLength], remaining)
+}
+
+func redactSensitiveText(value string) string {
+	for _, pattern := range redactionPatterns {
+		value = pattern.ReplaceAllString(value, `${1}[REDACTED]`)
+	}
+	return value
+}
+
 var commandTemplateVariablePattern = regexp.MustCompile(`\{\{\s*([a-zA-Z0-9_-]+)\s*\}\}`)
+
+func commandMatchesTemplate(command string, templateCommand string) bool {
+	command = strings.TrimSpace(command)
+	templateCommand = strings.TrimSpace(templateCommand)
+	if command == "" || templateCommand == "" {
+		return false
+	}
+	if command == templateCommand {
+		return true
+	}
+
+	matches := commandTemplateVariablePattern.FindAllStringIndex(templateCommand, -1)
+	if len(matches) == 0 {
+		return false
+	}
+
+	var pattern strings.Builder
+	pattern.WriteString("^")
+	last := 0
+	for _, match := range matches {
+		pattern.WriteString(regexp.QuoteMeta(templateCommand[last:match[0]]))
+		pattern.WriteString(`[^;&|\n]+`)
+		last = match[1]
+	}
+	pattern.WriteString(regexp.QuoteMeta(templateCommand[last:]))
+	pattern.WriteString("$")
+
+	compiled, err := regexp.Compile(pattern.String())
+	return err == nil && compiled.MatchString(command)
+}
 
 func extractCommandTemplateVariables(command string) []domain.CommandTemplateVariable {
 	matches := commandTemplateVariablePattern.FindAllStringSubmatch(command, -1)

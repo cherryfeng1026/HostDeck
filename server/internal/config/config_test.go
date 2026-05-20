@@ -14,7 +14,7 @@ func TestLoad_UsesConfigFileAndEnvOverride(t *testing.T) {
 
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
-	err := os.WriteFile(configPath, []byte("http_addr: \":9090\"\ndb_dsn: \"postgresql://config-user:config-pass@localhost:5432/configdb?sslmode=require\"\nmaster_key: \"test-master-key\"\nweb_dist_dir: \"../web/dist\"\npoll_interval_seconds: 30\npoll_concurrency: 3\ncleanup_interval_seconds: 600\nstatus_history_retention_hours: 48\ncommand_log_retention_hours: 72\nalert_history_retention_hours: 96\nauth_event_retention_hours: 120\naudit_event_retention_hours: 144\napi_token_retention_hours: 168\nalert_webhook_url: \"https://hooks.example.test/alerts\"\nalert_webhook_timeout_seconds: 9\n"), 0o644)
+	err := os.WriteFile(configPath, []byte("http_addr: \":9090\"\ndb_dsn: \"postgresql://config-user:config-pass@localhost:5432/configdb?sslmode=require\"\nmaster_key: \"test-master-key\"\nweb_dist_dir: \"../web/dist\"\nlog_file: \"../logs/hostdeck.log\"\nlog_level: \"debug\"\nlog_max_size_mb: 12\nlog_max_backups: 4\nlog_max_age_days: 9\nlog_compress: false\npoll_interval_seconds: 30\npoll_concurrency: 3\ncleanup_interval_seconds: 600\nstatus_history_retention_hours: 48\ncommand_log_retention_hours: 72\nalert_history_retention_hours: 96\nauth_event_retention_hours: 120\naudit_event_retention_hours: 144\napi_token_retention_hours: 168\nalert_webhook_url: \"https://hooks.example.test/alerts\"\nalert_webhook_timeout_seconds: 9\n"), 0o644)
 	if err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -33,6 +33,13 @@ func TestLoad_UsesConfigFileAndEnvOverride(t *testing.T) {
 	expectedWebDistDir := filepath.Clean(filepath.Join(dir, "../web/dist"))
 	if cfg.WebDistDir != expectedWebDistDir {
 		t.Fatalf("expected web dist dir %q, got %q", expectedWebDistDir, cfg.WebDistDir)
+	}
+	expectedLogFile := filepath.Clean(filepath.Join(dir, "../logs/hostdeck.log"))
+	if cfg.LogFile != expectedLogFile {
+		t.Fatalf("expected log file %q, got %q", expectedLogFile, cfg.LogFile)
+	}
+	if cfg.LogLevel != "debug" || cfg.LogMaxSizeMB != 12 || cfg.LogMaxBackups != 4 || cfg.LogMaxAgeDays != 9 || cfg.LogCompress {
+		t.Fatalf("unexpected log settings: %+v", cfg)
 	}
 	if cfg.CleanupIntervalSeconds != 600 {
 		t.Fatalf("expected cleanup interval 600, got %d", cfg.CleanupIntervalSeconds)
@@ -98,6 +105,40 @@ func TestLoad_RequiresMasterKeyWhenAlertWebhookConfigured(t *testing.T) {
 		t.Fatal("expected missing master key error")
 	}
 	if !strings.Contains(err.Error(), "master_key is required when alert webhook is configured") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoad_RejectsDefaultMasterKey(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(configPath, []byte("db_dsn: \"postgresql://config-user:config-pass@localhost:5432/configdb?sslmode=require\"\nmaster_key: \"change-me\"\n"), 0o644)
+	if err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err = config.Load(configPath)
+	if err == nil {
+		t.Fatal("expected default master key error")
+	}
+	if !strings.Contains(err.Error(), "master_key must not use the default value") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoad_RejectsInvalidLogLevel(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(configPath, []byte("db_dsn: \"postgresql://config-user:config-pass@localhost:5432/configdb?sslmode=require\"\nlog_level: \"trace\"\n"), 0o644)
+	if err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err = config.Load(configPath)
+	if err == nil {
+		t.Fatal("expected invalid log level error")
+	}
+	if !strings.Contains(err.Error(), "log_level must be one of debug, info, warn, or error") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

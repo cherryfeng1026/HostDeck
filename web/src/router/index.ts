@@ -38,6 +38,11 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '告警中心' },
   },
   {
+    path: '/alerts/rules',
+    component: () => import('../pages/AlertRulePage.vue'),
+    meta: { title: '告警规则' },
+  },
+  {
     path: '/:pathMatch(.*)*',
     redirect: '/',
   },
@@ -51,23 +56,28 @@ export const router = createRouter({
 router.beforeEach(async (to) => {
   const { isAuthenticated, currentUser } = useSession()
 
+  if (to.meta.public) {
+    if (to.path !== '/login') {
+      return true
+    }
+    try {
+      await ensureSessionLoaded()
+      if (isAuthenticated.value) {
+        return '/'
+      }
+    } catch {
+      return true
+    }
+    return true
+  }
+
   try {
     await ensureSessionLoaded()
   } catch {
-    if (to.meta.public) {
-      return true
-    }
     return {
       path: '/login',
       query: to.fullPath === '/' ? undefined : { redirect: to.fullPath },
     }
-  }
-
-  if (to.meta.public) {
-    if (to.path === '/login' && isAuthenticated.value) {
-      return '/'
-    }
-    return true
   }
 
   if (!isAuthenticated.value) {

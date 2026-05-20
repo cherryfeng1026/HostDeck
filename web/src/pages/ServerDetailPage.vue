@@ -7,45 +7,63 @@ import {
   useDialog,
   useMessage,
 } from 'naive-ui'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import StatusTrendCard from '../components/StatusTrendCard.vue'
-import { getServerMetrics, getServerStatus, probeServer, testServerSSH, trustServerHostKey } from '../services/api'
+import { useAutoRefresh } from '../auto-refresh'
+import { getServerDetailCache, loadServerDetail } from '../dashboard-cache'
+import { probeServer, testServerSSH, trustServerHostKey } from '../services/api'
 import { useSession } from '../session'
-import type { MetricPoint, ServerStatusDetail, TestSSHResponse } from '../types'
+import type { TestSSHResponse } from '../types'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
 const { canManageInfrastructure } = useSession()
-const loading = ref(false)
-const status = ref<ServerStatusDetail | null>(null)
-const metrics = ref<MetricPoint[]>([])
 
 const serverId = computed(() => Number(route.params.id))
+const currentCache = computed(() => (Number.isFinite(serverId.value) ? getServerDetailCache(serverId.value) : null))
+const loading = computed(() => currentCache.value?.loading ?? false)
+const status = computed(() => currentCache.value?.status ?? null)
+const metrics = computed(() => currentCache.value?.metrics ?? [])
 
-async function loadData() {
-  if (!Number.isFinite(serverId.value)) {
-    status.value = null
-    metrics.value = []
+const resourceCards = computed(() => {
+  if (!status.value) return []
+  return [
+    { label: 'CPU', value: status.value.cpuUsage || 0, suffix: '%', icon: 'CPU' },
+    { label: '内存', value: status.value.memoryUsage || 0, suffix: '%', icon: 'RAM' },
+    { label: '磁盘', value: status.value.diskUsage || 0, suffix: '%', icon: 'IO' },
+    { label: '负载', value: status.value.load1 || 0, suffix: '', icon: 'LD' },
+  ]
+})
+
+const systemInfo = computed(() => {
+  if (!status.value) return []
+  return [
+    { label: '主机名', value: status.value.hostname || '-' },
+    { label: '登录用户', value: status.value.username },
+    { label: '系统版本', value: status.value.osVersion || '尚未采集' },
+    { label: '内核版本', value: status.value.kernelVersion || '尚未采集' },
+    { label: '持续运行', value: formatUptime(status.value.uptimeSeconds) },
+    { label: '最近上报', value: formatLastReportAt(status.value.lastReportAt) },
+    { label: '采集模式', value: status.value.collectorMode },
+    { label: '已信任指纹', value: status.value.trustedHostKeyFingerprint || '未保存' },
+  ]
+})
+
+async function loadData(force = false, silent = false) {
+  const currentServerId = serverId.value
+  if (!Number.isFinite(currentServerId)) {
     return
   }
 
-  loading.value = true
   try {
-    const [statusResult, metricsResult] = await Promise.all([
-      getServerStatus(serverId.value),
-      getServerMetrics(serverId.value, '24h'),
-    ])
-    status.value = statusResult
-    metrics.value = metricsResult.points
+    await loadServerDetail(currentServerId, { force, silent })
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载服务器详情失败')
-    status.value = null
-    metrics.value = []
-  } finally {
-    loading.value = false
+    if (!silent && currentServerId === serverId.value) {
+      message.error(error instanceof Error ? error.message : '加载服务器详情失败')
+    }
   }
 }
 
@@ -54,28 +72,40 @@ async function handleProbe() {
   try {
     await probeServer(status.value.id)
     message.success('服务器采集请求已发送')
-    await loadData()
+    await loadData(true)
   } catch (error) {
     message.error(error instanceof Error ? error.message : '服务器采集失败')
   }
 }
 
+async function trustHostKeyAndRefresh(result: TestSSHResponse) {
+  if (!status.value || !result.hostKeyFingerprint) return
+  await trustServerHostKey(status.value.id, result.hostKeyFingerprint)
+  try {
+    await probeServer(status.value.id)
+    message.success('已保存 SSH 主机指纹并完成一次采集')
+  } catch (error) {
+    message.success('已保存 SSH 主机指纹')
+    if (error instanceof Error) {
+      message.warning(`自动采集未完成：${error.message}`)
+    }
+  }
+  await loadData(true)
+}
+
 function showSSHResult(result: TestSSHResponse) {
   if (!status.value) return
   const canTrustHostKey = Boolean(
-    result.hostKeyFingerprint && (result.fingerprintMismatch || (result.sshOk && result.hostKeyFingerprint !== result.trustedHostKeyFingerprint)),
+    result.hostKeyFingerprint
+      && (result.trustRequired || result.fingerprintMismatch || result.hostKeyFingerprint !== result.trustedHostKeyFingerprint),
   )
   if (canTrustHostKey) {
     dialog.warning({
       title: result.fingerprintMismatch ? 'SSH 指纹不匹配' : '发现 SSH 主机指纹',
       content: `${result.error || '请确认该主机指纹是否可信'}\n\n当前指纹：${result.hostKeyFingerprint}${result.trustedHostKeyFingerprint ? `\n已信任：${result.trustedHostKeyFingerprint}` : ''}`,
       positiveText: '信任并保存',
-      negativeText: result.sshOk ? '稍后处理' : '取消',
-      onPositiveClick: async () => {
-        await trustServerHostKey(status.value!.id, result.hostKeyFingerprint!)
-        message.success(result.sshOk ? '已保存 SSH 主机指纹，后续连接将强制校验' : '已保存 SSH 主机指纹')
-        await loadData()
-      },
+      negativeText: '取消',
+      onPositiveClick: () => trustHostKeyAndRefresh(result),
     })
     return
   }
@@ -106,7 +136,11 @@ function goToCommands() {
 
 function formatLastReportAt(value: string | undefined) {
   if (!value) return '尚未采集'
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() <= 1) {
+    return '尚未采集'
+  }
+  return parsed.toLocaleString('zh-CN', { hour12: false })
 }
 
 function formatUptime(seconds: number | undefined) {
@@ -121,145 +155,106 @@ function formatUptime(seconds: number | undefined) {
   return parts.join(' ')
 }
 
-function getTone(value: number) {
-  if (value >= 80) return '#f43f5e'
-  if (value >= 60) return '#f59e0b'
-  return '#10b981'
+function formatResourceValue(value: number, suffix: string) {
+  if (suffix) return `${Math.round(value)}${suffix}`
+  return value.toFixed(2)
+}
+
+function getTone(value: number, suffix: string) {
+  if (!suffix) return '#20d4ff'
+  if (value >= 80) return '#ff6b7d'
+  if (value >= 60) return '#e8b45f'
+  return '#20d4ff'
 }
 
 watch(
   () => route.params.id,
   () => {
-    void loadData()
+    void loadData(false, Boolean(currentCache.value?.initialized))
   },
 )
 
+useAutoRefresh(() => loadData(false, true), 15000)
+
 onMounted(() => {
-  void loadData()
+  void loadData(false, Boolean(currentCache.value?.initialized))
 })
 </script>
 
 <template>
   <n-scrollbar class="content-scroll">
-    <div class="page-container">
+    <div class="page-container detail-page">
       <n-spin :show="loading">
-        <div class="page-header">
-          <div class="header-back">
-            <n-button text style="color: #a1a1aa; font-size: 14px;" @click="router.push('/servers')">
-              ← 返回服务器列表
-            </n-button>
-          </div>
-          <div class="header-main" v-if="status">
-            <div class="header-text">
-              <div class="title-row">
-                <h1>{{ status.name }}</h1>
-                <n-tag :type="status.online ? 'success' : 'error'" size="small" bordered>
-                  <div class="status-dot-inline" :style="{ backgroundColor: status.online ? '#10b981' : '#f43f5e' }"></div>
-                  {{ status.online ? '在线' : '离线' }}
-                </n-tag>
-                <n-tag :type="status.sshOk ? 'success' : 'warning'" size="small" bordered>
-                  {{ status.sshOk ? 'SSH 正常' : 'SSH 异常' }}
-                </n-tag>
-                <n-tag v-if="!status.enabled" size="small" type="default" bordered>
-                  已禁用
-                </n-tag>
-              </div>
-              <p>{{ status.ip }}:{{ status.sshPort }} • {{ status.osVersion || '未知系统' }}</p>
-            </div>
-            <div class="header-actions">
-              <template v-if="canManageInfrastructure">
-                <n-button ghost :disabled="!status.enabled" @click="handleProbe" style="border-color: rgba(255,255,255,0.1)">立即采集</n-button>
-                <n-button ghost type="warning" :disabled="!status.enabled" @click="handleTestSSH">测试 SSH</n-button>
-                <n-button type="primary" class="glow-btn" :disabled="!status.enabled" @click="goToCommands">前往命令终端</n-button>
-              </template>
-              <n-tag v-else type="default" style="color: #a1a1aa; background: rgba(255,255,255,0.05)">只读权限</n-tag>
+        <div class="page-header detail-header">
+          <div class="header-text">
+            <n-button text class="back-link" @click="router.push('/servers')">← 返回服务器列表</n-button>
+            <div v-if="status" class="title-row">
+              <span class="title-status-dot" :class="{ online: status.online }" />
+              <h1>{{ status.name }}</h1>
+              <n-tag :type="status.online ? 'success' : 'error'" size="small" bordered>
+                <span class="status-dot-inline" :class="{ online: status.online }"></span>
+                {{ status.online ? '在线' : '离线' }}
+              </n-tag>
+              <n-tag v-if="!status.enabled" size="small" type="default" bordered>已禁用</n-tag>
             </div>
           </div>
-          <div v-else class="header-main" style="min-height: 80px; display: flex; align-items: center;">
-            <p style="color: #a1a1aa;">未找到服务器信息</p>
+          <div v-if="status" class="header-actions">
+            <template v-if="canManageInfrastructure">
+              <n-button ghost :disabled="!status.enabled" @click="handleProbe">立即采集</n-button>
+              <n-button ghost :disabled="!status.enabled" @click="handleTestSSH">测试 SSH</n-button>
+              <n-button type="primary" :disabled="!status.enabled" @click="goToCommands">命令终端</n-button>
+            </template>
+            <n-tag v-else type="default" bordered>只读</n-tag>
           </div>
         </div>
 
-        <div v-if="status" class="bento-grid">
-          <div class="bento-card span-2 sys-info-card">
-            <div class="card-title">系统信息</div>
+        <div v-if="status" class="detail-grid">
+          <section class="summary-panel">
+            <div class="summary-main">
+              <div>
+                <span class="summary-label">地址</span>
+                <strong>{{ status.ip }}:{{ status.sshPort }}</strong>
+              </div>
+              <div>
+                <span class="summary-label">系统</span>
+                <strong>{{ status.osVersion || '未知系统' }}</strong>
+              </div>
+              <div>
+                <span class="summary-label">上报</span>
+                <strong>{{ formatLastReportAt(status.lastReportAt) }}</strong>
+              </div>
+            </div>
+          </section>
+
+          <section class="resource-strip">
+            <article v-for="item in resourceCards" :key="item.label" class="resource-card">
+              <span class="resource-icon" aria-hidden="true">{{ item.icon }}</span>
+              <span>{{ item.label }}</span>
+              <strong>{{ formatResourceValue(item.value, item.suffix) }}</strong>
+              <div v-if="item.suffix" class="res-bar">
+                <div class="res-fill" :style="{ width: `${Math.max(0, Math.min(100, item.value))}%`, background: getTone(item.value, item.suffix) }"></div>
+              </div>
+              <div v-else class="load-note">5m {{ status.load5?.toFixed(2) }} · 15m {{ status.load15?.toFixed(2) }}</div>
+            </article>
+          </section>
+
+          <section class="info-panel">
+            <div class="panel-title">实例信息</div>
             <div class="info-grid">
-              <div class="info-item">
-                <span class="info-label">主机名</span>
-                <span class="info-val font-mono">{{ status.hostname || '-' }}</span>
-              </div>
-              <div class="info-item">
-                <span class="info-label">登录用户</span>
-                <span class="info-val">{{ status.username }}</span>
-              </div>
-              <div class="info-item">
-                <span class="info-label">采集模式</span>
-                <span class="info-val">{{ status.collectorMode }}</span>
-              </div>
-              <div class="info-item">
-                <span class="info-label">已信任指纹</span>
-                <span class="info-val font-mono">{{ status.trustedHostKeyFingerprint || '未保存' }}</span>
-              </div>
-              <div class="info-item">
-                <span class="info-label">内核版本</span>
-                <span class="info-val">{{ status.kernelVersion || '尚未采集' }}</span>
-              </div>
-              <div class="info-item">
-                <span class="info-label">持续运行</span>
-                <span class="info-val">{{ formatUptime(status.uptimeSeconds) }}</span>
-              </div>
-              <div class="info-item">
-                <span class="info-label">最近上报</span>
-                <span class="info-val">{{ formatLastReportAt(status.lastReportAt) }}</span>
+              <div v-for="item in systemInfo" :key="item.label" class="info-item">
+                <span>{{ item.label }}</span>
+                <strong>{{ item.value }}</strong>
               </div>
             </div>
-          </div>
+          </section>
 
-          <div class="bento-card resource-card">
-            <div class="resource-header">
-              <span class="res-title">CPU 使用率</span>
-            </div>
-            <div class="res-percent">{{ Math.round(status.cpuUsage || 0) }}%</div>
-            <div class="res-bar">
-              <div class="res-fill" :style="{ width: `${status.cpuUsage}%`, background: getTone(status.cpuUsage || 0) }"></div>
-            </div>
-          </div>
+          <section class="trend-panel">
+            <StatusTrendCard title="24 小时资源趋势" :points="metrics" />
+          </section>
+        </div>
 
-          <div class="bento-card resource-card">
-            <div class="resource-header">
-              <span class="res-title">内存使用</span>
-            </div>
-            <div class="res-percent">{{ Math.round(status.memoryUsage || 0) }}%</div>
-            <div class="res-bar">
-              <div class="res-fill" :style="{ width: `${status.memoryUsage}%`, background: getTone(status.memoryUsage || 0) }"></div>
-            </div>
-          </div>
-
-          <div class="bento-card resource-card">
-            <div class="resource-header">
-              <span class="res-title">磁盘使用</span>
-            </div>
-            <div class="res-percent">{{ Math.round(status.diskUsage || 0) }}%</div>
-            <div class="res-bar">
-              <div class="res-fill" :style="{ width: `${status.diskUsage}%`, background: getTone(status.diskUsage || 0) }"></div>
-            </div>
-          </div>
-
-          <div class="bento-card resource-card">
-            <div class="resource-header">
-              <span class="res-title">系统负载 (1m/5m/15m)</span>
-            </div>
-            <div class="res-percent" style="font-size: 24px; margin-top: 4px;">
-              {{ status.load1?.toFixed(2) }}
-            </div>
-            <div style="color: #a1a1aa; font-size: 13px; margin-top: 8px;">
-              / {{ status.load5?.toFixed(2) }} / {{ status.load15?.toFixed(2) }}
-            </div>
-          </div>
-
-          <div class="bento-card span-4 chart-card" style="padding: 0;">
-            <StatusTrendCard title="最近 24 小时资源趋势" :points="metrics" />
-          </div>
+        <div v-else class="empty-state">
+          未找到服务器信息。
         </div>
       </n-spin>
     </div>
@@ -271,42 +266,38 @@ onMounted(() => {
   flex: 1;
 }
 
-.page-container {
-  padding: 32px;
-  max-width: 1600px;
-  margin: 0 auto;
+.detail-page {
+  max-width: 100%;
+  margin: 0;
 }
 
-.header-back {
-  margin-bottom: 16px;
+.detail-header {
+  align-items: end;
 }
 
-.header-main {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  margin-bottom: 32px;
+.back-link {
+  margin-bottom: 8px;
+  color: var(--app-text-soft);
 }
 
 .title-row {
   display: flex;
   align-items: center;
-  gap: 16px;
-  margin-bottom: 8px;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
-.header-text h1 {
-  font-size: 32px;
-  font-weight: 600;
-  margin: 0;
-  color: #fff;
-  letter-spacing: -0.5px;
+.title-status-dot {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--app-danger);
+  box-shadow: 0 0 16px rgba(255, 107, 125, 0.42);
 }
 
-.header-text p {
-  margin: 0;
-  color: #a1a1aa;
-  font-size: 15px;
+.title-status-dot.online {
+  background: #35d6a3;
+  box-shadow: 0 0 18px rgba(53, 214, 163, 0.46);
 }
 
 .status-dot-inline {
@@ -315,147 +306,193 @@ onMounted(() => {
   height: 6px;
   border-radius: 50%;
   margin-right: 6px;
-  box-shadow: 0 0 8px rgba(255, 255, 255, 0.2);
+  background: var(--app-danger);
+}
+
+.status-dot-inline.online {
+  background: #35d6a3;
 }
 
 .header-actions {
   display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
-.glow-btn {
-  transition: all 0.3s ease;
-  border: none;
-}
-.glow-btn:not(:disabled):not(.n-button--disabled) {
-  box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
-  background-color: #10b981 !important;
-  color: #fff !important;
-}
-.glow-btn:not(:disabled):not(.n-button--disabled):hover {
-  box-shadow: 0 0 30px rgba(16, 185, 129, 0.6);
-  transform: translateY(-1px);
-}
-
-.bento-grid {
+.detail-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 24px;
+  grid-template-columns: minmax(0, 2fr) minmax(360px, 1fr);
+  gap: 14px;
 }
 
-.bento-card {
-  background: rgba(20, 20, 25, 0.6);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 20px;
-  padding: 24px;
+.summary-panel,
+.resource-card,
+.info-panel,
+.trend-panel {
+  border: 1px solid rgba(93, 120, 162, 0.22);
+  border-radius: 8px;
+  background: var(--app-panel);
+}
+
+.summary-panel {
+  grid-column: 1 / -1;
+  padding: 16px 18px;
+}
+
+.summary-main {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.summary-main div,
+.info-item {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.summary-label,
+.info-item span,
+.resource-card span,
+.load-note {
+  color: var(--app-text-soft);
+  font-size: 12px;
+}
+
+.summary-main strong,
+.info-item strong {
+  overflow: hidden;
+  color: var(--app-text);
+  font-size: 18px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-strip {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.resource-card {
+  min-height: 156px;
+  padding: 20px;
+  display: grid;
+  align-content: start;
+  gap: 12px;
   position: relative;
   overflow: hidden;
 }
 
-.span-2 { grid-column: span 2; }
-.span-4 { grid-column: span 4; }
-
-.card-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: #fff;
-  margin-bottom: 16px;
-}
-
-.info-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 16px 24px;
-}
-
-.info-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.info-label {
-  font-size: 12px;
-  color: #71717a;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.info-val {
-  font-size: 14px;
-  color: #ededed;
-  font-weight: 500;
-}
-
-.font-mono {
-  font-family: 'Fira Code', monospace;
-}
-
-.resource-card {
-  display: flex;
-  flex-direction: column;
-}
-
-.resource-header {
-  display: flex;
-  justify-content: space-between;
+.resource-icon {
+  position: absolute;
+  right: 20px;
+  top: 22px;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  border: 1px solid rgba(79, 131, 255, 0.26);
+  background: rgba(79, 131, 255, 0.1);
+  display: inline-flex;
   align-items: center;
-  margin-bottom: 16px;
+  justify-content: center;
+  color: #62a8ff;
+  font-family: var(--app-font-mono);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
 }
 
-.res-title {
-  color: #a1a1aa;
-  font-size: 14px;
-}
-
-.res-percent {
-  font-size: 36px;
-  font-weight: 700;
-  color: #fff;
-  margin-bottom: 16px;
+.resource-card strong {
+  color: var(--app-text);
+  font-size: 30px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 
 .res-bar {
   height: 6px;
-  background: rgba(255,255,255,0.05);
-  border-radius: 3px;
   overflow: hidden;
-  margin-top: auto;
+  border-radius: 8px;
+  background: rgba(93, 120, 162, 0.22);
 }
 
 .res-fill {
   height: 100%;
-  border-radius: 3px;
-  transition: width 0.3s ease, background-color 0.3s ease;
+  border-radius: inherit;
 }
 
-.chart-card {
-  min-height: 300px;
+.info-panel {
+  grid-column: 2;
+  grid-row: 3;
+  padding: 18px;
 }
 
-@media (max-width: 1024px) {
-  .bento-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
-  .info-grid {
-    grid-template-columns: 1fr 1fr;
-  }
+.panel-title {
+  margin-bottom: 14px;
+  color: var(--app-text);
+  font-size: 17px;
+  font-weight: 700;
 }
-@media (max-width: 640px) {
-  .header-main {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 16px;
-  }
-  .header-actions {
-    flex-wrap: wrap;
-  }
-  .bento-grid {
+
+.info-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+
+.info-item {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.55fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(93, 120, 162, 0.12);
+  background: transparent;
+  border-radius: 0;
+}
+
+.trend-panel {
+  grid-column: 1;
+  grid-row: 3;
+  overflow: hidden;
+}
+
+.empty-state {
+  padding: 48px 0;
+  color: var(--app-text-soft);
+  text-align: center;
+}
+
+@media (max-width: 1100px) {
+  .detail-grid {
     grid-template-columns: 1fr;
   }
-  .span-2, .span-4 {
-    grid-column: span 1;
+
+  .resource-strip,
+  .info-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .info-panel,
+  .trend-panel {
+    grid-column: auto;
+    grid-row: auto;
+  }
+}
+
+@media (max-width: 720px) {
+  .detail-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .summary-main,
+  .resource-strip,
   .info-grid {
     grid-template-columns: 1fr;
   }

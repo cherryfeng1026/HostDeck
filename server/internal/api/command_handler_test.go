@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -275,6 +276,57 @@ func TestCommandRoutes_ExecuteReturnsResult(t *testing.T) {
 	}
 }
 
+func TestCommandRoutes_ExecuteRejectsInvalidTimeout(t *testing.T) {
+	cases := []struct {
+		name           string
+		timeoutSeconds int
+	}{
+		{name: "negative", timeoutSeconds: -1},
+		{name: "too large", timeoutSeconds: 61},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openCommandTestDB(t)
+			serverRepo := storage.NewServerRepository(db, "test-master-key")
+			seedCommandServer(t, serverRepo)
+			commandService := service.NewCommandService(
+				service.NewServerConnectionService(
+					serverRepo,
+					storage.NewServerCredentialRepository(db),
+					"test-master-key",
+				),
+				&fakeCommandRunner{},
+				storage.NewCommandLogRepository(db),
+				storage.NewCommandTemplateRepository(db),
+			)
+			router := httpx.NewRouterWithHandlers(
+				api.NewServerHandler(serverRepo, nil),
+				nil,
+				nil,
+				nil,
+				api.NewCommandHandler(commandService),
+				nil,
+			)
+
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/api/servers/1/commands/execute",
+				bytes.NewBufferString(fmt.Sprintf(`{"command":"df -h","timeoutSeconds":%d,"source":"custom"}`, tc.timeoutSeconds)),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d body=%s", http.StatusBadRequest, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "timeoutSeconds") {
+				t.Fatalf("expected timeout validation error, got %s", rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
 	db := openCommandTestDB(t)
 	serverRepo := storage.NewServerRepository(db, "test-master-key")
@@ -356,8 +408,11 @@ func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list logs for server 2: %v", err)
 	}
-	if len(logs2) != 0 {
-		t.Fatalf("expected 0 logs for failed server 2, got %d", len(logs2))
+	if len(logs2) != 1 {
+		t.Fatalf("expected 1 failed log for server 2, got %d", len(logs2))
+	}
+	if logs2[0].ExitCode != -1 || !strings.Contains(logs2[0].Stderr, context.DeadlineExceeded.Error()) {
+		t.Fatalf("expected failed log to capture execution error, got %+v", logs2[0])
 	}
 	logs3, err := logRepo.ListByServerID(context.Background(), 3)
 	if err != nil {
@@ -373,6 +428,47 @@ func TestCommandRoutes_ExecuteBatchReturnsPerServerResults(t *testing.T) {
 	}
 	if len(audits) != 3 {
 		t.Fatalf("expected 3 audit events for concrete servers, got %d", len(audits))
+	}
+}
+
+func TestCommandRoutes_ExecuteReturnsBadGatewayForSSHFailure(t *testing.T) {
+	db := openCommandTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seedCommandServer(t, serverRepo)
+	commandService := service.NewCommandService(
+		service.NewServerConnectionService(
+			serverRepo,
+			storage.NewServerCredentialRepository(db),
+			"test-master-key",
+		),
+		&fakeCommandRunner{errorByHost: map[string]error{"10.0.0.21": errors.New("ssh: unable to authenticate, attempted methods [none password], no supported methods remain")}},
+		storage.NewCommandLogRepository(db),
+		storage.NewCommandTemplateRepository(db),
+	)
+
+	router := httpx.NewRouterWithHandlers(
+		api.NewServerHandler(serverRepo, nil),
+		nil,
+		nil,
+		nil,
+		api.NewCommandHandler(commandService),
+		nil,
+	)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/servers/1/commands/execute",
+		bytes.NewBufferString(`{"command":"df -h","timeoutSeconds":15,"source":"custom"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusBadGateway, rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unable to authenticate") {
+		t.Fatalf("expected ssh error body, got %s", rec.Body.String())
 	}
 }
 

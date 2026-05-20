@@ -18,8 +18,9 @@ import (
 )
 
 type stubSessionAuthenticator struct {
-	user domain.User
-	err  error
+	user   domain.User
+	scopes []string
+	err    error
 }
 
 func (s stubSessionAuthenticator) AuthenticateSession(ctx context.Context, token string) (domain.User, error) {
@@ -29,11 +30,14 @@ func (s stubSessionAuthenticator) AuthenticateSession(ctx context.Context, token
 	return s.user, nil
 }
 
-func (s stubSessionAuthenticator) AuthenticateAPIToken(ctx context.Context, token string) (domain.User, error) {
+func (s stubSessionAuthenticator) AuthenticateAPIToken(ctx context.Context, token string) (domain.User, []string, error) {
 	if s.err != nil {
-		return domain.User{}, s.err
+		return domain.User{}, nil, s.err
 	}
-	return s.user, nil
+	if s.scopes != nil {
+		return s.user, s.scopes, nil
+	}
+	return s.user, []string{domain.ScopeAll}, nil
 }
 
 func TestRouterAuth_ReadRoutesAllowViewer(t *testing.T) {
@@ -60,6 +64,114 @@ func TestRouterAuth_ReadRoutesAllowViewer(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected %s to return 200, got %d", path, rec.Code)
 		}
+	}
+}
+
+func TestRouterAuth_BearerTokenReadRoutesRequireMatchingScopes(t *testing.T) {
+	serverHandler := api.NewServerHandler(viewerServerStore{}, viewerLiveServerLister{})
+	alertHandler := api.NewAlertHandler(service.NewAlertService(viewerAlertRuleStore{}, viewerAlertStateStore{}, viewerAlertServerStore{}, nil))
+	commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}, viewerCommandTemplateStore{}))
+	router := httpx.NewRouterWithHandlers(
+		serverHandler,
+		nil,
+		nil,
+		nil,
+		commandHandler,
+		alertHandler,
+		httpx.WithAuthHandler(api.NewAuthHandler(nil, "hostdeck_session", false, "")),
+		httpx.WithAPIMiddleware(httpx.NewSessionAuthMiddleware(stubSessionAuthenticator{
+			user:   domain.User{ID: 1, Username: "api", Role: domain.RoleAdmin, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			scopes: []string{domain.ScopeCommandsRead},
+		}, "hostdeck_session")),
+		httpx.WithActionGuard(httpx.RequireInfrastructureAccess),
+	)
+
+	for _, item := range []struct {
+		path       string
+		wantStatus int
+	}{
+		{path: "/api/servers", wantStatus: http.StatusForbidden},
+		{path: "/api/alert-rules", wantStatus: http.StatusForbidden},
+		{path: "/api/commands/templates", wantStatus: http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodGet, item.path, nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != item.wantStatus {
+			t.Fatalf("expected %s to return %d, got %d", item.path, item.wantStatus, rec.Code)
+		}
+	}
+}
+
+func TestRouterAuth_BearerTokenCommandWriteRoutesRequireSpecificScopes(t *testing.T) {
+	for _, item := range []struct {
+		name       string
+		scopes     []string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{
+			name:       "execute scope can execute commands",
+			scopes:     []string{domain.ScopeCommandsExecute},
+			method:     http.MethodPost,
+			path:       "/api/servers/1/commands/execute",
+			body:       `{"command":"df -h","timeoutSeconds":1}`,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "execute scope cannot mutate templates",
+			scopes:     []string{domain.ScopeCommandsExecute},
+			method:     http.MethodPost,
+			path:       "/api/commands/templates",
+			body:       `{"name":"disk","command":"df -h","scope":"personal","riskLevel":"normal"}`,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "template write scope can mutate templates",
+			scopes:     []string{domain.ScopeCommandTemplatesWrite},
+			method:     http.MethodPost,
+			path:       "/api/commands/templates",
+			body:       `{"name":"disk","command":"df -h","scope":"personal","riskLevel":"normal"}`,
+			wantStatus: http.StatusCreated,
+		},
+		{
+			name:       "template write scope cannot execute commands",
+			scopes:     []string{domain.ScopeCommandTemplatesWrite},
+			method:     http.MethodPost,
+			path:       "/api/servers/1/commands/execute",
+			body:       `{"command":"df -h","timeoutSeconds":1}`,
+			wantStatus: http.StatusForbidden,
+		},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			commandHandler := api.NewCommandHandler(service.NewCommandService(viewerCommandServerResolver{}, viewerCommandRunner{}, viewerCommandLogStore{}, viewerCommandTemplateStore{}))
+			router := httpx.NewRouterWithHandlers(
+				nil,
+				nil,
+				nil,
+				nil,
+				commandHandler,
+				nil,
+				httpx.WithAuthHandler(api.NewAuthHandler(nil, "hostdeck_session", false, "")),
+				httpx.WithAPIMiddleware(httpx.NewSessionAuthMiddleware(stubSessionAuthenticator{
+					user:   domain.User{ID: 1, Username: "api", Role: domain.RoleAdmin, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+					scopes: item.scopes,
+				}, "hostdeck_session")),
+				httpx.WithActionGuard(httpx.RequireInfrastructureAccess),
+			)
+
+			req := httptest.NewRequest(item.method, item.path, strings.NewReader(item.body))
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != item.wantStatus {
+				t.Fatalf("expected %s %s to return %d, got %d", item.method, item.path, item.wantStatus, rec.Code)
+			}
+		})
 	}
 }
 
@@ -169,6 +281,7 @@ func (viewerAlertRuleStore) List(ctx context.Context) ([]domain.AlertRule, error
 }
 func (viewerAlertRuleStore) Create(ctx context.Context, rule domain.AlertRule) error { return nil }
 func (viewerAlertRuleStore) Update(ctx context.Context, rule domain.AlertRule) error { return nil }
+func (viewerAlertRuleStore) Delete(ctx context.Context, id int64) error              { return nil }
 
 type viewerAlertServerStore struct{}
 
@@ -235,6 +348,10 @@ func (viewerCommandTemplateStore) List(ctx context.Context, filter domain.Comman
 		RiskLevel:  domain.CommandTemplateRiskNormal,
 		IsFavorite: false,
 	}}, nil
+}
+
+func (viewerCommandTemplateStore) GetByID(ctx context.Context, templateID string, username string) (domain.CommandTemplate, error) {
+	return domain.CommandTemplate{ID: templateID, Scope: domain.CommandTemplateScopeShared, RiskLevel: domain.CommandTemplateRiskNormal}, nil
 }
 
 func (viewerCommandTemplateStore) Create(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error) {

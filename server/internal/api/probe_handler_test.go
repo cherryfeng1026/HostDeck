@@ -18,6 +18,46 @@ import (
 	"hostdeck/server/internal/testsupport"
 )
 
+const collectorBatchCommand = `sh -c '
+set -eu
+section() { printf "__HOSTDECK__:%s\n" "$1"; }
+section cpu
+cat /proc/stat
+sleep 1
+cat /proc/stat
+section meminfo
+cat /proc/meminfo
+section disk
+df -P /
+section loadavg
+cat /proc/loadavg
+section osrelease
+cat /etc/os-release
+section kernel
+uname -r
+section uptime
+cat /proc/uptime
+'`
+
+const collectorBatchOutput = `__HOSTDECK__:cpu
+cpu  100 0 100 900 0 0 0 0 0 0
+cpu  140 0 140 940 0 0 0 0 0 0
+__HOSTDECK__:meminfo
+MemTotal: 2048000 kB
+MemAvailable: 1024000 kB
+__HOSTDECK__:disk
+Filesystem 1024-blocks Used Available Capacity Mounted on
+/dev/vda1 100000 55000 45000 55% /
+__HOSTDECK__:loadavg
+0.15 0.20 0.25 1/100 12345
+__HOSTDECK__:osrelease
+PRETTY_NAME="Ubuntu 24.04 LTS"
+__HOSTDECK__:kernel
+6.8.0-31-generic
+__HOSTDECK__:uptime
+12345.67 23456.78
+`
+
 type fakeRunner struct {
 	results     map[string]fakeRunResult
 	targets     []sshx.Target
@@ -53,16 +93,18 @@ type testSSHResponse struct {
 	HostKeyFingerprint        string `json:"hostKeyFingerprint"`
 	TrustedHostKeyFingerprint string `json:"trustedHostKeyFingerprint"`
 	FingerprintMismatch       bool   `json:"fingerprintMismatch"`
+	TrustRequired             bool   `json:"trustRequired"`
 }
 
 type probeResponse struct {
 	Snapshot struct {
-		Online      bool    `json:"online"`
-		SSHOK       bool    `json:"sshOk"`
-		CPUUsage    float64 `json:"cpuUsage"`
-		MemoryUsage float64 `json:"memoryUsage"`
-		DiskUsage   float64 `json:"diskUsage"`
-		Load1       float64 `json:"load1"`
+		Online            bool    `json:"online"`
+		SSHOK             bool    `json:"sshOk"`
+		CPUUsage          float64 `json:"cpuUsage"`
+		MemoryUsage       float64 `json:"memoryUsage"`
+		DiskUsage         float64 `json:"diskUsage"`
+		Load1             float64 `json:"load1"`
+		CollectDurationMS int64   `json:"collectDurationMs"`
 	} `json:"snapshot"`
 }
 
@@ -142,11 +184,64 @@ func TestProbeRoutes_TestSSHReturnsStatusAndLatency(t *testing.T) {
 	if resp.LatencyMS < 0 {
 		t.Fatalf("expected non-negative latency, got %d", resp.LatencyMS)
 	}
+	if resp.TrustRequired {
+		t.Fatalf("expected trustRequired to be false when ssh succeeds")
+	}
 	if len(runner.targets) != 2 {
 		t.Fatalf("expected fingerprint probe and ssh run targets, got %d", len(runner.targets))
 	}
 	if runner.targets[0].Password != "super-secret" || runner.targets[1].Password != "super-secret" {
 		t.Fatalf("expected decrypted password in ssh targets, got %+v", runner.targets)
+	}
+}
+
+func TestProbeRoutes_TestSSHRequiresTrustWhenFingerprintIsUntrusted(t *testing.T) {
+	db := openProbeTestDB(t)
+	serverRepo := storage.NewServerRepository(db, "test-master-key")
+	seedProbeServer(t, serverRepo)
+	connectionService := service.NewServerConnectionService(
+		serverRepo,
+		storage.NewServerCredentialRepository(db),
+		"test-master-key",
+	)
+	runner := &fakeRunner{
+		fingerprint: "SHA256:first-seen",
+		results: map[string]fakeRunResult{
+			"true": {err: sshx.HostKeyTrustRequiredError{Actual: "SHA256:first-seen"}},
+		},
+	}
+
+	handler := api.NewProbeHandler(
+		connectionService,
+		runner,
+		storage.NewStatusRepository(db),
+		nil,
+	)
+	router := httpx.NewRouterWithHandlers(api.NewServerHandler(serverRepo, nil), handler, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/1/test-ssh", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	var resp testSSHResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.SSHOK {
+		t.Fatalf("expected sshOk to be false")
+	}
+	if !resp.TrustRequired {
+		t.Fatalf("expected trustRequired to be true")
+	}
+	if resp.HostKeyFingerprint != "SHA256:first-seen" {
+		t.Fatalf("unexpected hostKeyFingerprint: %q", resp.HostKeyFingerprint)
+	}
+	if !strings.Contains(resp.Error, "SSH 主机指纹尚未信任") {
+		t.Fatalf("unexpected error: %q", resp.Error)
 	}
 }
 
@@ -161,13 +256,7 @@ func TestProbeRoutes_ProbePersistsLatestStatus(t *testing.T) {
 	)
 	runner := &fakeRunner{
 		results: map[string]fakeRunResult{
-			"sh -c 'cat /proc/stat; sleep 1; cat /proc/stat'": {stdout: "cpu  100 0 100 900 0 0 0 0 0 0\ncpu  140 0 140 940 0 0 0 0 0 0\n"},
-			"cat /proc/meminfo":   {stdout: "MemTotal: 2048000 kB\nMemAvailable: 1024000 kB\n"},
-			"df -P /":             {stdout: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 100000 55000 45000 55% /\n"},
-			"cat /proc/loadavg":   {stdout: "0.15 0.20 0.25 1/100 12345\n"},
-			"cat /etc/os-release": {stdout: "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\n"},
-			"uname -r":            {stdout: "6.8.0-31-generic\n"},
-			"cat /proc/uptime":    {stdout: "12345.67 23456.78\n"},
+			collectorBatchCommand: {stdout: collectorBatchOutput},
 		},
 	}
 

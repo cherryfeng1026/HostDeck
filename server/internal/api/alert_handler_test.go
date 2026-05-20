@@ -78,7 +78,8 @@ func newAlertRouterForTest(t *testing.T) (http.Handler, *sql.DB, *storage.AlertR
 		t.Fatalf("create initial admin: %v", err)
 	}
 
-	alertService := service.NewAlertService(alertRepo, alertRepo, serverRepo, alertRepo)
+	alertNotifier := service.NewDynamicWebhookAlertNotifier(alertRepo, alertRepo)
+	alertService := service.NewAlertService(alertRepo, alertRepo, serverRepo, alertRepo, alertNotifier)
 	router := httpx.NewRouterWithHandlers(
 		nil,
 		nil,
@@ -356,6 +357,212 @@ func TestAlertHandler_UpdateNotificationSettingsPersistsAndAudits(t *testing.T) 
 	}
 	if audits[0].Summary == "https://hooks.example.test/alerts" || strings.Contains(audits[0].Summary, "hooks.example.test") {
 		t.Fatalf("expected audit summary to be redacted, got %+v", audits[0])
+	}
+}
+
+func TestAlertHandler_ListNotificationDeliveriesRejectsInvalidStatus(t *testing.T) {
+	router, _, _, _ := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/alert-notification-deliveries?status=bogus&limit=5", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAlertHandler_ListNotificationDeliveriesReturnsRecentItems(t *testing.T) {
+	router, _, alertRepo, _ := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+
+	_, err := alertRepo.CreateNotificationDelivery(context.Background(), domain.AlertNotificationDelivery{
+		EventType:  domain.AlertEventTriggered,
+		AlertID:    11,
+		RuleID:     3,
+		ServerID:   1,
+		ServerName: "prod-web-01",
+		Status:     domain.AlertNotificationDeliveryPending,
+		OccurredAt: time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC),
+	}, `{"eventType":"triggered"}`)
+	if err != nil {
+		t.Fatalf("create notification delivery: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/alert-notification-deliveries?limit=5", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload []domain.AlertNotificationDelivery
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode deliveries response: %v", err)
+	}
+	if len(payload) != 1 || payload[0].ServerName != "prod-web-01" || payload[0].Status != domain.AlertNotificationDeliveryPending {
+		t.Fatalf("unexpected deliveries payload: %+v", payload)
+	}
+}
+
+func TestAlertHandler_RetryNotificationDeliveriesReturnsCount(t *testing.T) {
+	t.Setenv("HOSTDECK_ALLOW_PRIVATE_WEBHOOK_HOSTS", "1")
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	router, _, alertRepo, _ := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+	if _, err := alertRepo.SaveNotificationSettings(context.Background(), domain.AlertNotificationSettings{Enabled: true, WebhookURL: target.URL, WebhookTimeoutSeconds: 2}); err != nil {
+		t.Fatalf("save notification settings: %v", err)
+	}
+	if _, err := alertRepo.CreateNotificationDelivery(context.Background(), domain.AlertNotificationDelivery{
+		EventType:  domain.AlertEventTriggered,
+		AlertID:    11,
+		RuleID:     3,
+		ServerID:   1,
+		ServerName: "prod-web-01",
+		Status:     domain.AlertNotificationDeliveryFailed,
+		OccurredAt: time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC),
+	}, `{"eventType":"triggered","alert":{"id":11,"ruleId":3,"serverId":1,"serverName":"prod-web-01"},"occurredAt":"2026-04-20T12:00:00Z"}`); err != nil {
+		t.Fatalf("create notification delivery: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/alert-notification-deliveries/retry?limit=5", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]int
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if payload["retried"] != 1 {
+		t.Fatalf("expected one retry, got %+v", payload)
+	}
+}
+
+func TestAlertHandler_TestNotificationSettingsSendsWebhook(t *testing.T) {
+	t.Setenv("HOSTDECK_ALLOW_PRIVATE_WEBHOOK_HOSTS", "1")
+	received := make(chan service.AlertNotification, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload service.AlertNotification
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode webhook payload: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	router, _, alertRepo, _ := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+	if _, err := alertRepo.SaveNotificationSettings(context.Background(), domain.AlertNotificationSettings{Enabled: true, WebhookURL: target.URL, WebhookTimeoutSeconds: 2}); err != nil {
+		t.Fatalf("save notification settings: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/alert-notification-settings/test", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case payload := <-received:
+		if payload.EventType != domain.AlertEventTest || !strings.Contains(payload.Alert.Message, "admin") {
+			t.Fatalf("unexpected test payload: %+v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected webhook test notification")
+	}
+}
+
+func TestAlertHandler_UpdateRuleReturnsNotFoundWhenMissing(t *testing.T) {
+	router, _, _, _ := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/alert-rules/999", strings.NewReader(`{"metric":"memory_usage","operator":"gte","threshold":80,"durationSeconds":60,"enabled":true,"scopeType":"all","scopeValue":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAlertHandler_CreateRuleRejectsInvalidMetric(t *testing.T) {
+	router, _, _, _ := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/alert-rules", strings.NewReader(`{"metric":"load1","operator":"gte","threshold":80,"durationSeconds":60,"enabled":true,"scopeType":"all","scopeValue":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAlertHandler_DeleteRuleRemovesRuleAndCurrentState(t *testing.T) {
+	router, _, alertRepo, auditRepo := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+	seedActiveAlert(t, alertRepo)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/alert-rules/1", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rules, err := alertRepo.List(context.Background())
+	if err != nil {
+		t.Fatalf("list alert rules: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("expected rule to be deleted, got %+v", rules)
+	}
+	states, err := alertRepo.ListCurrentStates(context.Background())
+	if err != nil {
+		t.Fatalf("list alert states: %v", err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("expected current state to be cleared, got %+v", states)
+	}
+	history, err := alertRepo.ListHistory(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("list alert history: %v", err)
+	}
+	if len(history) != 2 || history[0].EventType != domain.AlertEventResolved || history[0].Detail != "规则已删除" {
+		t.Fatalf("expected resolved history for deleted rule, got %+v", history)
+	}
+	audits, err := auditRepo.ListRecent(context.Background(), 10, "")
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	if len(audits) != 1 || audits[0].Title != "删除告警规则" {
+		t.Fatalf("expected delete audit event, got %+v", audits)
+	}
+}
+
+func TestAlertHandler_DeleteRuleReturnsNotFoundWhenMissing(t *testing.T) {
+	router, _, _, _ := newAlertRouterForTest(t)
+	cookie := loginAsAdmin(t, router)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/alert-rules/999", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

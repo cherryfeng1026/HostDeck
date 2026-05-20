@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"hostdeck/server/internal/api"
+	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/httpx"
 	"hostdeck/server/internal/service"
 	"hostdeck/server/internal/storage"
@@ -104,6 +105,7 @@ func TestAuthHandlerStatusReportsInitialization(t *testing.T) {
 	var payload struct {
 		Initialized      bool `json:"initialized"`
 		BootstrapEnabled bool `json:"bootstrapEnabled"`
+		Authenticated    bool `json:"authenticated"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
 		t.Fatalf("decode response: %v", err)
@@ -113,6 +115,56 @@ func TestAuthHandlerStatusReportsInitialization(t *testing.T) {
 	}
 	if !payload.BootstrapEnabled {
 		t.Fatal("expected bootstrapEnabled to be true")
+	}
+	if payload.Authenticated {
+		t.Fatal("expected authenticated to be false")
+	}
+}
+
+func TestAuthHandlerStatusReturnsCurrentUserWhenAuthenticated(t *testing.T) {
+	router := newAuthRouterForTest(t)
+	cookie := loginAsDefaultAdmin(t, router)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Initialized      bool `json:"initialized"`
+		BootstrapEnabled bool `json:"bootstrapEnabled"`
+		Authenticated    bool `json:"authenticated"`
+		User             struct {
+			Username string `json:"username"`
+		} `json:"user"`
+		Permissions struct {
+			CanManageInfrastructure bool `json:"canManageInfrastructure"`
+			CanManageUsers          bool `json:"canManageUsers"`
+			CanChangeOwnPassword    bool `json:"canChangeOwnPassword"`
+		} `json:"permissions"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !payload.Initialized {
+		t.Fatal("expected initialized to be true")
+	}
+	if !payload.BootstrapEnabled {
+		t.Fatal("expected bootstrapEnabled to be true")
+	}
+	if !payload.Authenticated {
+		t.Fatal("expected authenticated to be true")
+	}
+	if payload.User.Username != "admin" {
+		t.Fatalf("unexpected username %q", payload.User.Username)
+	}
+	if !payload.Permissions.CanManageInfrastructure || !payload.Permissions.CanManageUsers || !payload.Permissions.CanChangeOwnPassword {
+		t.Fatalf("unexpected permissions: %+v", payload.Permissions)
 	}
 }
 
@@ -143,6 +195,94 @@ func TestAuthHandlerLoginReturnsPreconditionFailedWhenUninitialized(t *testing.T
 
 	if rec.Code != http.StatusPreconditionFailed {
 		t.Fatalf("expected 412, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuthHandlerLoginUsesRemoteAddrWhenForwardedHeadersPresent(t *testing.T) {
+	db := openAuthHandlerTestDB(t)
+	eventRepo := storage.NewAuthEventRepository(db)
+	authService := service.NewAuthService(
+		storage.NewUserRepository(db),
+		storage.NewSessionRepository(db),
+		storage.NewAPITokenRepository(db),
+		eventRepo,
+		24*time.Hour,
+	)
+	if _, err := authService.CreateInitialAdmin(context.Background(), "admin", "admin123", "", "", "test_setup"); err != nil {
+		t.Fatalf("create initial admin: %v", err)
+	}
+	router := httpx.NewRouterWithHandlers(
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		httpx.WithAuthHandler(api.NewAuthHandler(authService, "hostdeck_session", false, "bootstrap-token")),
+		httpx.WithAPIMiddleware(httpx.NewSessionAuthMiddleware(authService, "hostdeck_session")),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"admin","password":"admin123"}`))
+	req.RemoteAddr = "203.0.113.10:4567"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", "10.0.0.100")
+	req.Header.Set("X-Real-IP", "10.0.0.101")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected login status %d, got %d body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	events, err := eventRepo.ListRecent(context.Background(), 1, "", domain.AuthEventLoginSucceeded)
+	if err != nil {
+		t.Fatalf("list auth events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 login event, got %d", len(events))
+	}
+	if events[0].IP != "203.0.113.10" {
+		t.Fatalf("expected remote address IP, got %q", events[0].IP)
+	}
+}
+
+func TestAuthHandlerBootstrapAdminSucceedsAfterUninitializedLoginAttempt(t *testing.T) {
+	db := openAuthHandlerTestDB(t)
+	authService := service.NewAuthService(
+		storage.NewUserRepository(db),
+		storage.NewSessionRepository(db),
+		storage.NewAPITokenRepository(db),
+		storage.NewAuthEventRepository(db),
+		24*time.Hour,
+	)
+	router := httpx.NewRouterWithHandlers(
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		httpx.WithAuthHandler(api.NewAuthHandler(authService, "hostdeck_session", false, "bootstrap-token")),
+		httpx.WithAPIMiddleware(httpx.NewSessionAuthMiddleware(authService, "hostdeck_session")),
+	)
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"admin","password":"admin123"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected pre-bootstrap login 412, got %d body=%s", loginRec.Code, loginRec.Body.String())
+	}
+
+	bootstrapReq := httptest.NewRequest(http.MethodPost, "/api/auth/bootstrap-admin", strings.NewReader(`{"username":"admin","password":"admin123"}`))
+	bootstrapReq.Header.Set("Content-Type", "application/json")
+	bootstrapReq.Header.Set("X-HostDeck-Bootstrap-Token", "bootstrap-token")
+	bootstrapRec := httptest.NewRecorder()
+	router.ServeHTTP(bootstrapRec, bootstrapReq)
+	if bootstrapRec.Code != http.StatusCreated {
+		t.Fatalf("expected bootstrap 201, got %d body=%s", bootstrapRec.Code, bootstrapRec.Body.String())
+	}
+	if len(bootstrapRec.Result().Cookies()) == 0 {
+		t.Fatal("expected session cookie after bootstrap")
 	}
 }
 

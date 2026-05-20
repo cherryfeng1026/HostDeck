@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "e2e:serve": "node ./scripts/run-hostdeck-e2e-server.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headed": "playwright test --project=edge --headed"
   },
   "dependencies": {
     "echarts": "^6.0.0",
@@ -15,6 +19,8 @@
     "vue-router": "^4.5.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/node": "^24.10.0",
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "^5.8.3",
     "vite": "^6.3.5"

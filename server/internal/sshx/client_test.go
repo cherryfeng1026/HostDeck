@@ -4,15 +4,18 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
 type fakeClient struct {
-	session sessionRunner
+	session   sessionRunner
+	closeFunc func() error
 }
 
 func (c fakeClient) NewSession() (sessionRunner, error) {
@@ -20,6 +23,9 @@ func (c fakeClient) NewSession() (sessionRunner, error) {
 }
 
 func (c fakeClient) Close() error {
+	if c.closeFunc != nil {
+		return c.closeFunc()
+	}
 	return nil
 }
 
@@ -117,11 +123,73 @@ func TestClientRunReturnsRemoteExitCode(t *testing.T) {
 	}
 }
 
+type blockingSession struct {
+	closed chan struct{}
+}
+
+func (s *blockingSession) SetStdout(io.Writer) {}
+
+func (s *blockingSession) SetStderr(io.Writer) {}
+
+func (s *blockingSession) Run(string) error {
+	<-s.closed
+	return errors.New("session closed")
+}
+
+func (s *blockingSession) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
+}
+
+func TestClientRunCancelsBlockedSession(t *testing.T) {
+	session := &blockingSession{closed: make(chan struct{})}
+	clientClosed := make(chan struct{})
+	client := Client{
+		open: func(context.Context, Target) (sessionClient, error) {
+			return fakeClient{
+				session: session,
+				closeFunc: func() error {
+					select {
+					case <-clientClosed:
+					default:
+						close(clientClosed)
+					}
+					return nil
+				},
+			}, nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, exitCode, err := client.Run(ctx, Target{Host: "10.0.0.21", Username: "root"}, "sleep 60")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline error, got %v", err)
+	}
+	if exitCode != -1 {
+		t.Fatalf("expected exit code -1, got %d", exitCode)
+	}
+	select {
+	case <-session.closed:
+	case <-time.After(time.Second):
+		t.Fatal("expected session to be closed")
+	}
+	select {
+	case <-clientClosed:
+	case <-time.After(time.Second):
+		t.Fatal("expected client to be closed")
+	}
+}
+
 func TestHostKeyCaptureAcceptsMatchingFingerprint(t *testing.T) {
 	publicKey := newTestPublicKey(t)
 	fingerprint := ssh.FingerprintSHA256(publicKey)
 	capture := &hostKeyCapture{}
-	callback := capture.callback(fingerprint)
+	callback := capture.callback(Target{TrustedHostKeyFingerprint: fingerprint})
 	if err := callback("", nil, publicKey); err != nil {
 		t.Fatalf("expected matching fingerprint to pass, got %v", err)
 	}
@@ -134,7 +202,7 @@ func TestHostKeyCaptureRejectsMismatchedFingerprint(t *testing.T) {
 	publicKey := newTestPublicKey(t)
 	actual := ssh.FingerprintSHA256(publicKey)
 	capture := &hostKeyCapture{}
-	err := capture.callback("SHA256:trusted")("", nil, publicKey)
+	err := capture.callback(Target{TrustedHostKeyFingerprint: "SHA256:trusted"})("", nil, publicKey)
 	if err == nil {
 		t.Fatal("expected mismatch error")
 	}
@@ -147,6 +215,36 @@ func TestHostKeyCaptureRejectsMismatchedFingerprint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SSH 主机指纹不匹配") {
 		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestHostKeyCaptureRejectsUntrustedFingerprint(t *testing.T) {
+	publicKey := newTestPublicKey(t)
+	actual := ssh.FingerprintSHA256(publicKey)
+	capture := &hostKeyCapture{}
+	err := capture.callback(Target{})("", nil, publicKey)
+	if err == nil {
+		t.Fatal("expected trust required error")
+	}
+	trustErr, ok := err.(HostKeyTrustRequiredError)
+	if !ok {
+		t.Fatalf("expected HostKeyTrustRequiredError, got %T", err)
+	}
+	if trustErr.Actual != actual {
+		t.Fatalf("unexpected trust required error: %+v", trustErr)
+	}
+}
+
+func TestHostKeyCaptureAllowsUnknownFingerprintForDiscovery(t *testing.T) {
+	publicKey := newTestPublicKey(t)
+	fingerprint := ssh.FingerprintSHA256(publicKey)
+	capture := &hostKeyCapture{}
+	callback := capture.callback(Target{AllowUnknownHostKey: true})
+	if err := callback("", nil, publicKey); err != nil {
+		t.Fatalf("expected discovery to pass, got %v", err)
+	}
+	if capture.actual != fingerprint {
+		t.Fatalf("unexpected captured fingerprint: %q", capture.actual)
 	}
 }
 

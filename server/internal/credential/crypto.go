@@ -25,6 +25,9 @@ func NewCipher(masterKey string) (*Cipher, error) {
 	if trimmed == "" || trimmed == "change-me" {
 		return nil, errors.New("master_key 未配置，无法安全保存服务器密码")
 	}
+	if len(trimmed) < 16 {
+		return nil, errors.New("master_key 长度不足，至少需要 16 个字符")
+	}
 
 	reader := hkdf.New(sha256.New, []byte(trimmed), nil, []byte(infoContext))
 	key := make([]byte, 32)

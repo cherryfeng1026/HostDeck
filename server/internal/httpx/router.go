@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"hostdeck/server/internal/api"
+	"hostdeck/server/internal/domain"
 )
 
 type RouterOption func(*routerOptions)
@@ -65,12 +66,20 @@ func NewRouterWithHandlers(
 	api.RegisterPublicAuthRoutes(r, options.authHandler)
 
 	registerCommonProtected := func(target chi.Router) {
-		api.RegisterOverviewRoutes(target, overviewHandler)
-		api.RegisterServerDetailRoutes(target, detailHandler)
-		api.RegisterServerReadRoutes(target, serverHandler)
-		api.RegisterAlertReadRoutes(target, alertHandler)
-		api.RegisterCommandTemplateReadRoutes(target, commandHandler)
-		api.RegisterShellRoutes(target, options.shellHandler)
+		target.With(RequireScope(domain.ScopeServersRead)).Group(func(serverReadRoutes chi.Router) {
+			api.RegisterOverviewRoutes(serverReadRoutes, overviewHandler)
+			api.RegisterServerDetailRoutes(serverReadRoutes, detailHandler)
+			api.RegisterServerReadRoutes(serverReadRoutes, serverHandler)
+		})
+		target.With(RequireScope(domain.ScopeAlertsRead)).Group(func(alertReadRoutes chi.Router) {
+			api.RegisterAlertReadRoutes(alertReadRoutes, alertHandler)
+		})
+		target.With(RequireScope(domain.ScopeCommandsRead)).Group(func(commandReadRoutes chi.Router) {
+			api.RegisterCommandTemplateReadRoutes(commandReadRoutes, commandHandler)
+		})
+		target.With(RequireSessionAuth).Group(func(sessionRoutes chi.Router) {
+			api.RegisterShellRoutes(sessionRoutes, options.shellHandler)
+		})
 		if options.authHandler != nil {
 			target.With(RequireSessionAuth).Get("/api/auth/me", options.authHandler.CurrentUser)
 			target.With(RequireSessionAuth).Post("/api/auth/change-password", options.authHandler.ChangePassword)
@@ -87,11 +96,22 @@ func NewRouterWithHandlers(
 		}
 	}
 	registerManagedProtected := func(target chi.Router) {
-		api.RegisterServerWriteRoutes(target, serverHandler)
-		api.RegisterProbeRoutes(target, probeHandler)
-		api.RegisterCommandHistoryRoutes(target, commandHandler)
-		api.RegisterCommandWriteRoutes(target, commandHandler)
-		api.RegisterAlertWriteRoutes(target, alertHandler)
+		target.With(RequireScope(domain.ScopeServersWrite)).Group(func(serverRoutes chi.Router) {
+			api.RegisterServerWriteRoutes(serverRoutes, serverHandler)
+			api.RegisterProbeRoutes(serverRoutes, probeHandler)
+		})
+		target.With(RequireScope(domain.ScopeCommandsRead)).Group(func(commandReadRoutes chi.Router) {
+			api.RegisterCommandHistoryRoutes(commandReadRoutes, commandHandler)
+		})
+		target.With(RequireScope(domain.ScopeCommandTemplatesWrite)).Group(func(commandTemplateWriteRoutes chi.Router) {
+			api.RegisterCommandTemplateWriteRoutes(commandTemplateWriteRoutes, commandHandler)
+		})
+		target.With(RequireScope(domain.ScopeCommandsExecute)).Group(func(commandWriteRoutes chi.Router) {
+			api.RegisterCommandExecutionRoutes(commandWriteRoutes, commandHandler)
+		})
+		target.With(RequireScope(domain.ScopeAlertsWrite)).Group(func(alertRoutes chi.Router) {
+			api.RegisterAlertWriteRoutes(alertRoutes, alertHandler)
+		})
 	}
 
 	if options.apiMiddleware != nil {

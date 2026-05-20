@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS servers (
     tags TEXT NOT NULL DEFAULT '[]',
     purpose TEXT NOT NULL DEFAULT '',
     remark TEXT NOT NULL DEFAULT '',
+    expires_at TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -48,7 +49,15 @@ CREATE TABLE IF NOT EXISTS server_status_latest (
     load_5 REAL NOT NULL,
     load_15 REAL NOT NULL,
     last_report_at TEXT NOT NULL,
-    source TEXT NOT NULL
+    source TEXT NOT NULL,
+    collect_status TEXT NOT NULL DEFAULT 'unknown',
+    last_collect_started_at TEXT NOT NULL DEFAULT '',
+    last_collect_finished_at TEXT NOT NULL DEFAULT '',
+    last_success_at TEXT NOT NULL DEFAULT '',
+    last_collect_error TEXT NOT NULL DEFAULT '',
+    collect_failure_count INTEGER NOT NULL DEFAULT 0,
+    collect_duration_ms BIGINT NOT NULL DEFAULT 0,
+    stale INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -70,12 +79,21 @@ const createCommandLogsTableSQL = `
 CREATE TABLE IF NOT EXISTS command_logs (
     id BIGSERIAL PRIMARY KEY,
     server_id BIGINT NOT NULL,
+    server_name TEXT NOT NULL DEFAULT '',
+    server_ip TEXT NOT NULL DEFAULT '',
+    executor_username TEXT NOT NULL DEFAULT '',
     command TEXT NOT NULL,
     stdout TEXT NOT NULL,
     stderr TEXT NOT NULL,
     exit_code INTEGER NOT NULL,
     duration_ms BIGINT NOT NULL,
-    executed_at TIMESTAMPTZ NOT NULL
+    executed_at TIMESTAMPTZ NOT NULL,
+    source TEXT NOT NULL DEFAULT 'custom',
+    template_id TEXT NOT NULL DEFAULT '',
+    risk_level TEXT NOT NULL DEFAULT 'normal',
+    risk_confirmed INTEGER NOT NULL DEFAULT 0,
+    executor_auth_method TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT ''
 );
 `
 
@@ -87,6 +105,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     threshold REAL NOT NULL,
     duration_seconds INTEGER NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    scope_type TEXT NOT NULL DEFAULT 'all',
+    scope_value TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -142,6 +162,7 @@ CREATE TABLE IF NOT EXISTS server_credentials (
     server_id BIGINT PRIMARY KEY,
     auth_type TEXT NOT NULL DEFAULT 'password',
     password_ciphertext TEXT NOT NULL DEFAULT '',
+    private_key_ciphertext TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -193,6 +214,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     name TEXT NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
     token_prefix TEXT NOT NULL,
+    scopes TEXT NOT NULL DEFAULT '[]',
     last_used_at TEXT NOT NULL DEFAULT '',
     expires_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -259,6 +281,14 @@ const createCommandTemplateFavoritesUsernameIndexSQL = `
 CREATE INDEX IF NOT EXISTS idx_command_template_favorites_username ON command_template_favorites (username, created_at DESC);
 `
 
+const createServerStatusHistorySampledAtIndexSQL = `
+CREATE INDEX IF NOT EXISTS idx_server_status_history_sampled_at ON server_status_history (sampled_at);
+`
+
+const createServerStatusHistoryServerSampledAtIndexSQL = `
+CREATE INDEX IF NOT EXISTS idx_server_status_history_server_sampled_at ON server_status_history (server_id, sampled_at);
+`
+
 const normalizeAlertNotificationSettingsSingletonSQL = `
 DELETE FROM alert_notification_settings
  WHERE id NOT IN (
@@ -277,6 +307,11 @@ const addServersMaintenanceWindowSQL = `
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS maintenance_start_at TEXT,
     ADD COLUMN IF NOT EXISTS maintenance_end_at TEXT;
+`
+
+const addServerPrivateKeyAndExpiresAtSQL = `
+ALTER TABLE server_credentials ADD COLUMN IF NOT EXISTS private_key_ciphertext TEXT NOT NULL DEFAULT '';
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS expires_at TEXT;
 `
 
 const createUserSessionsExpiresIndexSQL = `
@@ -327,6 +362,70 @@ CREATE INDEX IF NOT EXISTS idx_api_tokens_user_active ON api_tokens (user_id, re
 
 const createAPITokensHashIndexSQL = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens (token_hash);
+`
+
+const addCommandLogsServerSnapshotSQL = `
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS server_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS server_ip TEXT NOT NULL DEFAULT '';
+ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS server_name TEXT NOT NULL DEFAULT '';
+UPDATE command_logs c SET server_name = COALESCE(s.name, ''), server_ip = COALESCE(s.ip, '') FROM servers s WHERE c.server_id = s.id AND (c.server_name = '' OR c.server_ip = '');
+UPDATE alert_history h SET server_name = COALESCE(s.name, '') FROM servers s WHERE h.server_id = s.id AND h.server_name = '';
+CREATE INDEX IF NOT EXISTS idx_command_logs_server_name_executed_at ON command_logs (server_name, executed_at DESC);
+`
+
+const addAPITokensScopesSQL = `
+ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scopes TEXT NOT NULL DEFAULT '[]';
+UPDATE api_tokens SET scopes = '["*"]' WHERE scopes = '' OR scopes = '[]';
+`
+
+const addCommandLogsAuditFieldsSQL = `
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'custom';
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS template_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS risk_level TEXT NOT NULL DEFAULT 'normal';
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS risk_confirmed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS executor_auth_method TEXT NOT NULL DEFAULT '';
+ALTER TABLE command_logs ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_command_logs_risk_executed_at ON command_logs (risk_level, executed_at DESC);
+`
+
+const addServerStatusCollectStateSQL = `
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS collect_status TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS last_collect_started_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS last_collect_finished_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS last_success_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS last_collect_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS collect_failure_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS collect_duration_ms BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS stale INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_server_status_latest_collect_status ON server_status_latest (collect_status);
+`
+
+const addAlertRuleScopeSQL = `
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS scope_type TEXT NOT NULL DEFAULT 'all';
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS scope_value TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_alert_rules_scope ON alert_rules (scope_type, scope_value);
+`
+
+const createAlertNotificationDeliveriesTableSQL = `
+CREATE TABLE IF NOT EXISTS alert_notification_deliveries (
+    id BIGSERIAL PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    alert_id BIGINT NOT NULL DEFAULT 0,
+    rule_id BIGINT NOT NULL DEFAULT 0,
+    server_id BIGINT NOT NULL DEFAULT 0,
+    server_name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    last_attempt_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_notification_deliveries_status_next ON alert_notification_deliveries (status, next_attempt_at, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_notification_deliveries_created_at ON alert_notification_deliveries (created_at DESC);
 `
 
 type migrationStep struct {
@@ -431,6 +530,56 @@ var schemaMigrations = []migrationStep{
 			createCommandTemplateFavoritesTableSQL,
 			createCommandTemplatesScopeIndexSQL,
 			createCommandTemplateFavoritesUsernameIndexSQL,
+		},
+	},
+	{
+		version: 14,
+		statements: []string{
+			createServerStatusHistorySampledAtIndexSQL,
+			createServerStatusHistoryServerSampledAtIndexSQL,
+		},
+	},
+	{
+		version: 15,
+		statements: []string{
+			addCommandLogsServerSnapshotSQL,
+		},
+	},
+	{
+		version: 16,
+		statements: []string{
+			addAPITokensScopesSQL,
+		},
+	},
+	{
+		version: 17,
+		statements: []string{
+			addCommandLogsAuditFieldsSQL,
+		},
+	},
+	{
+		version: 18,
+		statements: []string{
+			addServerStatusCollectStateSQL,
+		},
+	},
+	{
+		version: 19,
+		statements: []string{
+			addAlertRuleScopeSQL,
+			createAlertNotificationDeliveriesTableSQL,
+		},
+	},
+	{
+		version: 20,
+		statements: []string{
+			`ALTER TABLE server_status_latest ADD COLUMN IF NOT EXISTS collect_duration_ms BIGINT NOT NULL DEFAULT 0;`,
+		},
+	},
+	{
+		version: 21,
+		statements: []string{
+			addServerPrivateKeyAndExpiresAtSQL,
 		},
 	},
 }

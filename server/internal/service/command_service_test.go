@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,10 +36,11 @@ func (r commandTestResolver) ResolveServer(ctx context.Context, serverID int64) 
 type commandTestRunner struct {
 	stdout string
 	stderr string
+	err    error
 }
 
 func (r commandTestRunner) Run(ctx context.Context, target sshx.Target, command string) (string, string, int, error) {
-	return r.stdout, r.stderr, 0, nil
+	return r.stdout, r.stderr, 0, r.err
 }
 
 type commandTestLogStore struct {
@@ -72,6 +74,18 @@ func (s *commandTestTemplateStore) List(ctx context.Context, filter domain.Comma
 	items := make([]domain.CommandTemplate, len(s.items))
 	copy(items, s.items)
 	return items, nil
+}
+
+func (s *commandTestTemplateStore) GetByID(ctx context.Context, templateID string, username string) (domain.CommandTemplate, error) {
+	if len(s.items) == 0 {
+		s.items = defaultCommandTemplatesForTest()
+	}
+	for _, item := range s.items {
+		if item.ID == templateID {
+			return item, nil
+		}
+	}
+	return domain.CommandTemplate{}, nil
 }
 
 func (s *commandTestTemplateStore) Create(ctx context.Context, input domain.CommandTemplateCreateInput, username string) (domain.CommandTemplate, error) {
@@ -199,6 +213,79 @@ func TestCommandService_SetTemplateFavoriteUpdatesStore(t *testing.T) {
 	}
 }
 
+func TestCommandService_ExecuteDetectsDangerousRemoveFlagVariants(t *testing.T) {
+	tests := []string{
+		"rm -fr /tmp/hostdeck",
+		"rm -Rf /tmp/hostdeck",
+		"rm -r -f /tmp/hostdeck",
+	}
+
+	for _, command := range tests {
+		t.Run(command, func(t *testing.T) {
+			svc := service.NewCommandService(
+				commandTestResolver{server: domain.Server{Password: "secret"}},
+				commandTestRunner{},
+				&commandTestLogStore{},
+				&commandTestTemplateStore{},
+			)
+
+			_, err := svc.ExecuteWithExecutor(context.Background(), 1, command, 5*time.Second, "operator")
+			if !errors.Is(err, service.ErrCommandRiskConfirmationRequired) {
+				t.Fatalf("expected risk confirmation for %q, got %v", command, err)
+			}
+		})
+	}
+}
+
+func TestCommandService_ExecuteRejectsTemplateCommandMismatch(t *testing.T) {
+	svc := service.NewCommandService(
+		commandTestResolver{server: domain.Server{Password: "secret"}},
+		commandTestRunner{},
+		&commandTestLogStore{},
+		&commandTestTemplateStore{},
+	)
+
+	_, err := svc.ExecuteCommand(context.Background(), domain.CommandExecutionInput{
+		ServerID:           1,
+		Command:            "uptime",
+		TemplateID:         "service-restart",
+		RiskConfirmed:      true,
+		ExecutorUsername:   "operator",
+		ExecutorAuthMethod: "password",
+	})
+	if !errors.Is(err, service.ErrCommandTemplateMismatch) {
+		t.Fatalf("expected template mismatch error, got %v", err)
+	}
+}
+
+func TestCommandService_ExecuteAllowsResolvedTemplateCommand(t *testing.T) {
+	logs := &commandTestLogStore{}
+	svc := service.NewCommandService(
+		commandTestResolver{server: domain.Server{Password: "secret"}},
+		commandTestRunner{},
+		logs,
+		&commandTestTemplateStore{},
+	)
+
+	result, err := svc.ExecuteCommand(context.Background(), domain.CommandExecutionInput{
+		ServerID:           1,
+		Command:            "sudo systemctl restart nginx",
+		TemplateID:         "service-restart",
+		RiskConfirmed:      true,
+		ExecutorUsername:   "operator",
+		ExecutorAuthMethod: "password",
+	})
+	if err != nil {
+		t.Fatalf("execute resolved template command: %v", err)
+	}
+	if result.Source != domain.CommandSourceTemplate || result.TemplateID != "service-restart" {
+		t.Fatalf("expected template execution metadata, got %+v", result)
+	}
+	if len(logs.items) != 1 || logs.items[0].Source != domain.CommandSourceTemplate {
+		t.Fatalf("expected template command log, got %+v", logs.items)
+	}
+}
+
 func TestCommandService_ExecuteRedactsSensitiveOutputAndTruncates(t *testing.T) {
 	logs := &commandTestLogStore{}
 	svc := service.NewCommandService(
@@ -211,9 +298,12 @@ func TestCommandService_ExecuteRedactsSensitiveOutputAndTruncates(t *testing.T) 
 		&commandTestTemplateStore{},
 	)
 
-	result, err := svc.ExecuteWithExecutor(context.Background(), 1, "printenv", 5*time.Second, "operator")
+	result, err := svc.ExecuteWithExecutor(context.Background(), 1, "echo token=abc123", 5*time.Second, "operator")
 	if err != nil {
 		t.Fatalf("execute with redaction: %v", err)
+	}
+	if contains(result.Command, "abc123") || !containsRedactionMarker(result.Command) {
+		t.Fatalf("expected redacted command text, got %q", result.Command)
 	}
 	if containsSensitiveToken(result.Stdout) || containsSensitiveToken(result.Stderr) {
 		t.Fatalf("expected redacted outputs, got stdout=%q stderr=%q", result.Stdout, result.Stderr)
@@ -229,6 +319,33 @@ func TestCommandService_ExecuteRedactsSensitiveOutputAndTruncates(t *testing.T) 
 	}
 	if logs.items[0].Stdout != result.Stdout || logs.items[0].Stderr != result.Stderr {
 		t.Fatalf("expected stored log to use sanitized output, got %+v", logs.items[0])
+	}
+	if logs.items[0].Command != result.Command {
+		t.Fatalf("expected stored log to use sanitized command, got %+v", logs.items[0])
+	}
+}
+
+func TestCommandService_ExecuteLogsRunnerFailures(t *testing.T) {
+	logs := &commandTestLogStore{}
+	svc := service.NewCommandService(
+		commandTestResolver{server: domain.Server{Password: "secret"}},
+		commandTestRunner{err: errors.New("ssh handshake failed")},
+		logs,
+		&commandTestTemplateStore{},
+	)
+
+	result, err := svc.ExecuteWithExecutor(context.Background(), 1, "uptime", 5*time.Second, "operator")
+	if err == nil {
+		t.Fatal("expected execution error")
+	}
+	if result.ExitCode != -1 || !contains(result.Stderr, "ssh handshake failed") {
+		t.Fatalf("expected failed result to include execution error, got %+v", result)
+	}
+	if len(logs.items) != 1 {
+		t.Fatalf("expected failed command log, got %d", len(logs.items))
+	}
+	if logs.items[0].ExitCode != -1 || !contains(logs.items[0].Stderr, "ssh handshake failed") {
+		t.Fatalf("expected failed log to include execution error, got %+v", logs.items[0])
 	}
 }
 

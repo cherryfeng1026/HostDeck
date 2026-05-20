@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -19,11 +20,13 @@ import (
 )
 
 const (
-	minPasswordLength  = 8
-	maxLoginFailures   = 5
-	loginFailureWindow = 15 * time.Minute
-	loginLockDuration  = 15 * time.Minute
-	sessionTouchWindow = 5 * time.Minute
+	minPasswordLength        = 8
+	maxLoginFailures         = 5
+	loginFailureWindow       = 15 * time.Minute
+	loginLockDuration        = 15 * time.Minute
+	sessionTouchWindow       = 5 * time.Minute
+	expiredSessionCleanupTTL = 10 * time.Minute
+	uninitializedCacheTTL    = 10 * time.Second
 )
 
 var (
@@ -41,6 +44,7 @@ var (
 	ErrCannotChangeOwnRole      = errors.New("不能修改当前账号角色")
 	ErrLastEnabledAdminRequired = errors.New("系统至少需要保留一个启用中的管理员")
 	ErrAPITokenNotFound         = errors.New("API Token 不存在")
+	ErrInvalidAPITokenScope     = errors.New("API Token 权限范围无效")
 )
 
 type AuthUserStore interface {
@@ -68,7 +72,7 @@ type AuthEventStore interface {
 }
 
 type AuthAPITokenStore interface {
-	Create(ctx context.Context, userID int64, name string, tokenHash string, prefix string, expiresAt *time.Time, now time.Time) (domain.APIToken, error)
+	Create(ctx context.Context, userID int64, name string, tokenHash string, prefix string, scopes []string, expiresAt *time.Time, now time.Time) (domain.APIToken, error)
 	ListActiveByUserID(ctx context.Context, userID int64) ([]domain.APIToken, error)
 	GetByID(ctx context.Context, id int64) (storage.APITokenRecord, error)
 	GetByTokenHash(ctx context.Context, tokenHash string) (storage.APITokenRecord, error)
@@ -90,8 +94,10 @@ type AuthService struct {
 	events     AuthEventStore
 	sessionTTL time.Duration
 
-	mu       sync.Mutex
-	attempts map[string]loginAttempt
+	mu                       sync.Mutex
+	attempts                 map[string]loginAttempt
+	lastExpiredSessionPrune  time.Time
+	uninitializedCachedUntil time.Time
 }
 
 func NewAuthService(users AuthUserStore, sessions AuthSessionStore, apiTokens AuthAPITokenStore, events AuthEventStore, sessionTTL time.Duration) *AuthService {
@@ -157,6 +163,10 @@ func (s *AuthService) CreateInitialAdmin(ctx context.Context, username string, p
 		return domain.User{}, err
 	}
 
+	s.mu.Lock()
+	s.uninitializedCachedUntil = time.Time{}
+	s.mu.Unlock()
+
 	_ = s.recordEvent(ctx, domain.AuthEvent{
 		UserID:    user.ID,
 		Username:  user.Username,
@@ -176,26 +186,30 @@ func (s *AuthService) Login(ctx context.Context, username string, password strin
 		return domain.User{}, "", time.Time{}, ErrInvalidCredentials
 	}
 
-	userCount, err := s.users.Count(ctx)
+	initialized, err := s.IsInitialized(ctx)
 	if err != nil {
 		return domain.User{}, "", time.Time{}, err
 	}
-	if userCount == 0 {
+	if !initialized {
 		return domain.User{}, "", time.Time{}, ErrSystemUninitialized
 	}
 
 	attemptKey := loginAttemptKey(username, remoteIP)
-	if s.isLocked(attemptKey, time.Now().UTC()) {
+	now := time.Now().UTC()
+	if s.isLocked(attemptKey, now) {
+		slog.Warn("login blocked", "username", username, "remoteIP", remoteIP, "reason", "too_many_attempts")
 		return domain.User{}, "", time.Time{}, ErrTooManyLoginAttempts
 	}
-	if s.sessions != nil {
-		_ = s.sessions.DeleteExpired(ctx, time.Now().UTC())
+	s.pruneStaleAttempts(now)
+	if err := s.pruneExpiredSessionsIfNeeded(ctx, now); err != nil {
+		slog.Warn("prune expired sessions failed", "error", err)
 	}
 
 	record, err := s.users.GetByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			s.registerFailure(attemptKey, time.Now().UTC())
+			slog.Warn("login failed", "username", username, "remoteIP", remoteIP, "reason", "invalid_credentials")
 			_ = s.recordEvent(ctx, domain.AuthEvent{
 				Username:  username,
 				EventType: domain.AuthEventLoginFailed,
@@ -210,6 +224,7 @@ func (s *AuthService) Login(ctx context.Context, username string, password strin
 
 	if err := bcrypt.CompareHashAndPassword([]byte(record.PasswordHash), []byte(password)); err != nil {
 		s.registerFailure(attemptKey, time.Now().UTC())
+		slog.Warn("login failed", "username", record.Username, "userID", record.ID, "remoteIP", remoteIP, "reason", "invalid_credentials")
 		_ = s.recordEvent(ctx, domain.AuthEvent{
 			UserID:    record.ID,
 			Username:  record.Username,
@@ -221,6 +236,7 @@ func (s *AuthService) Login(ctx context.Context, username string, password strin
 		return domain.User{}, "", time.Time{}, ErrInvalidCredentials
 	}
 	if !record.Enabled {
+		slog.Warn("login failed", "username", record.Username, "userID", record.ID, "remoteIP", remoteIP, "reason", "user_disabled")
 		_ = s.recordEvent(ctx, domain.AuthEvent{
 			UserID:    record.ID,
 			Username:  record.Username,
@@ -238,7 +254,6 @@ func (s *AuthService) Login(ctx context.Context, username string, password strin
 		return domain.User{}, "", time.Time{}, err
 	}
 
-	now := time.Now().UTC()
 	expiresAt := now.Add(s.sessionTTL)
 	if err := s.sessions.Create(ctx, record.ID, tokenHash, expiresAt, remoteIP, userAgent); err != nil {
 		return domain.User{}, "", time.Time{}, err
@@ -257,6 +272,7 @@ func (s *AuthService) Login(ctx context.Context, username string, password strin
 		IP:        remoteIP,
 		UserAgent: userAgent,
 	})
+	slog.Info("login succeeded", "username", user.Username, "userID", user.ID, "remoteIP", remoteIP, "expiresAt", expiresAt)
 
 	return user, token, expiresAt, nil
 }
@@ -305,43 +321,43 @@ func (s *AuthService) AuthenticateSession(ctx context.Context, token string) (do
 	return record.User, nil
 }
 
-func (s *AuthService) AuthenticateAPIToken(ctx context.Context, token string) (domain.User, error) {
+func (s *AuthService) AuthenticateAPIToken(ctx context.Context, token string) (domain.User, []string, error) {
 	token = strings.TrimSpace(token)
 	if token == "" || s.apiTokens == nil {
-		return domain.User{}, ErrUnauthenticated
+		return domain.User{}, nil, ErrUnauthenticated
 	}
 
 	tokenHash := hashSessionToken(token)
 	record, err := s.apiTokens.GetByTokenHash(ctx, tokenHash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return domain.User{}, ErrUnauthenticated
+			return domain.User{}, nil, ErrUnauthenticated
 		}
-		return domain.User{}, err
+		return domain.User{}, nil, err
 	}
 	if record.RevokedAt != nil && !record.RevokedAt.IsZero() {
-		return domain.User{}, ErrUnauthenticated
+		return domain.User{}, nil, ErrUnauthenticated
 	}
 	if record.ExpiresAt != nil && !record.ExpiresAt.After(time.Now().UTC()) {
-		return domain.User{}, ErrUnauthenticated
+		return domain.User{}, nil, ErrUnauthenticated
 	}
 
 	userRecord, err := s.users.GetByID(ctx, record.UserID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return domain.User{}, ErrUnauthenticated
+			return domain.User{}, nil, ErrUnauthenticated
 		}
-		return domain.User{}, err
+		return domain.User{}, nil, err
 	}
 	if !userRecord.Enabled {
-		return domain.User{}, ErrUserDisabled
+		return domain.User{}, nil, ErrUserDisabled
 	}
 
 	now := time.Now().UTC()
 	if record.LastUsedAt == nil || now.Sub(*record.LastUsedAt) >= sessionTouchWindow {
 		_ = s.apiTokens.Touch(ctx, record.ID, now)
 	}
-	return userRecord.User, nil
+	return userRecord.User, record.Scopes, nil
 }
 
 func (s *AuthService) Logout(ctx context.Context, token string, remoteIP string, userAgent string) error {
@@ -420,6 +436,7 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID int64, currentP
 		IP:        remoteIP,
 		UserAgent: userAgent,
 	})
+	slog.Info("password changed", "username", record.Username, "userID", record.ID, "remoteIP", remoteIP)
 	return nil
 }
 
@@ -512,6 +529,16 @@ func (s *AuthService) UpdateUser(ctx context.Context, actor domain.User, userID 
 		IP:        remoteIP,
 		UserAgent: userAgent,
 	})
+	slog.Info(
+		"user updated",
+		"actor", actor.Username,
+		"target", updated.Username,
+		"targetUserID", updated.ID,
+		"role", updated.Role,
+		"enabled", updated.Enabled,
+		"sessionsRevoked", !enabled || role != record.Role,
+		"remoteIP", remoteIP,
+	)
 	return updated.User, nil
 }
 
@@ -549,6 +576,7 @@ func (s *AuthService) ResetUserPassword(ctx context.Context, actor domain.User, 
 		IP:        remoteIP,
 		UserAgent: userAgent,
 	})
+	slog.Warn("user password reset", "actor", actor.Username, "target", record.Username, "targetUserID", record.ID, "remoteIP", remoteIP)
 	return nil
 }
 
@@ -574,10 +602,11 @@ func (s *AuthService) RevokeUserSessions(ctx context.Context, actor domain.User,
 		IP:        remoteIP,
 		UserAgent: userAgent,
 	})
+	slog.Warn("user sessions revoked", "actor", actor.Username, "target", record.Username, "targetUserID", record.ID, "remoteIP", remoteIP)
 	return nil
 }
 
-func (s *AuthService) CreateAPIToken(ctx context.Context, actor domain.User, name string, expiresInHours int, remoteIP string, userAgent string) (domain.APIToken, string, error) {
+func (s *AuthService) CreateAPIToken(ctx context.Context, actor domain.User, name string, expiresInHours int, scopes []string, remoteIP string, userAgent string) (domain.APIToken, string, error) {
 	if actor.ID <= 0 || s.apiTokens == nil {
 		return domain.APIToken{}, "", ErrUnauthenticated
 	}
@@ -587,6 +616,10 @@ func (s *AuthService) CreateAPIToken(ctx context.Context, actor domain.User, nam
 	}
 	if expiresInHours < 0 {
 		return domain.APIToken{}, "", errors.New("过期时间无效")
+	}
+	normalizedScopes, err := normalizeAPITokenScopes(scopes)
+	if err != nil {
+		return domain.APIToken{}, "", err
 	}
 
 	token, tokenHash, err := newSessionToken()
@@ -603,7 +636,7 @@ func (s *AuthService) CreateAPIToken(ctx context.Context, actor domain.User, nam
 		value := now.Add(time.Duration(expiresInHours) * time.Hour)
 		expiresAt = &value
 	}
-	item, err := s.apiTokens.Create(ctx, actor.ID, name, tokenHash, prefix, expiresAt, now)
+	item, err := s.apiTokens.Create(ctx, actor.ID, name, tokenHash, prefix, normalizedScopes, expiresAt, now)
 	if err != nil {
 		return domain.APIToken{}, "", err
 	}
@@ -690,11 +723,56 @@ func (s *AuthService) validateAdminRetention(ctx context.Context, current domain
 }
 
 func (s *AuthService) IsInitialized(ctx context.Context) (bool, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	cached := s.uninitializedCachedUntil
+	s.mu.Unlock()
+	if cached.After(now) {
+		return false, nil
+	}
+
 	count, err := s.users.Count(ctx)
 	if err != nil {
 		return false, err
 	}
-	return count > 0, nil
+	if count == 0 {
+		s.mu.Lock()
+		s.uninitializedCachedUntil = now.Add(uninitializedCacheTTL)
+		s.mu.Unlock()
+		return false, nil
+	}
+
+	s.mu.Lock()
+	s.uninitializedCachedUntil = time.Time{}
+	s.mu.Unlock()
+	return true, nil
+}
+
+func (s *AuthService) pruneExpiredSessionsIfNeeded(ctx context.Context, now time.Time) error {
+	if s.sessions == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	lastRun := s.lastExpiredSessionPrune
+	if !lastRun.IsZero() && now.Sub(lastRun) < expiredSessionCleanupTTL {
+		s.mu.Unlock()
+		return nil
+	}
+	s.lastExpiredSessionPrune = now
+	s.mu.Unlock()
+
+	if err := s.sessions.DeleteExpired(ctx, now); err != nil {
+		s.mu.Lock()
+		if s.lastExpiredSessionPrune.Equal(now) {
+			s.lastExpiredSessionPrune = lastRun
+		}
+		s.mu.Unlock()
+		return err
+	}
+
+	return nil
 }
 
 func (s *AuthService) isLocked(key string, now time.Time) bool {
@@ -714,6 +792,20 @@ func (s *AuthService) isLocked(key string, now time.Time) bool {
 	return false
 }
 
+func (s *AuthService) pruneStaleAttempts(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, attempt := range s.attempts {
+		if !attempt.lockedUntil.IsZero() && attempt.lockedUntil.After(now) {
+			continue
+		}
+		if now.Sub(attempt.firstFailedAt) > loginFailureWindow*2 {
+			delete(s.attempts, key)
+		}
+	}
+}
+
 func (s *AuthService) registerFailure(key string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -725,6 +817,7 @@ func (s *AuthService) registerFailure(key string, now time.Time) {
 	attempt.count++
 	if attempt.count >= maxLoginFailures {
 		attempt.lockedUntil = now.Add(loginLockDuration)
+		slog.Warn("login locked due to too many attempts", "key", key, "lockedUntil", attempt.lockedUntil, "count", attempt.count)
 	}
 	s.attempts[key] = attempt
 }
@@ -752,6 +845,42 @@ func hashPassword(password string) (string, error) {
 
 func normalizeUsername(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeAPITokenScopes(scopes []string) ([]string, error) {
+	validScopes := map[string]struct{}{
+		domain.ScopeAll:                   {},
+		domain.ScopeServersRead:           {},
+		domain.ScopeServersWrite:          {},
+		domain.ScopeCommandsRead:          {},
+		domain.ScopeCommandsExecute:       {},
+		domain.ScopeCommandTemplatesWrite: {},
+		domain.ScopeAlertsRead:            {},
+		domain.ScopeAlertsWrite:           {},
+	}
+	seen := map[string]struct{}{}
+	items := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		if _, ok := validScopes[scope]; !ok {
+			return nil, ErrInvalidAPITokenScope
+		}
+		if _, ok := seen[scope]; ok {
+			continue
+		}
+		seen[scope] = struct{}{}
+		items = append(items, scope)
+	}
+	if len(items) == 0 {
+		return nil, ErrInvalidAPITokenScope
+	}
+	if _, hasAll := seen[domain.ScopeAll]; hasAll && len(items) > 1 {
+		return nil, ErrInvalidAPITokenScope
+	}
+	return items, nil
 }
 
 func loginAttemptKey(username string, remoteIP string) string {

@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { NAlert, NButton, NCheckbox, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ensureSessionLoaded, loginWithPassword, useSession } from '../session'
+import { loginWithPassword, useSession } from '../session'
 
 const router = useRouter()
 const route = useRoute()
@@ -14,20 +14,34 @@ const model = ref({
   remember: true,
 })
 
+const loginInputInlineStyle = [
+  'font-family: Inter, "Segoe UI", "PingFang SC", sans-serif',
+  'font-size: 16px',
+  'font-weight: 500',
+  'line-height: 48px',
+  'height: 48px',
+  'letter-spacing: 0',
+  '-webkit-text-size-adjust: 100%',
+  'text-size-adjust: 100%',
+].join('; ')
+
+const usernameInputProps = {
+  autocomplete: 'username',
+  autocapitalize: 'none',
+  spellcheck: 'false',
+  style: loginInputInlineStyle,
+}
+
+const passwordInputProps = {
+  autocomplete: 'current-password',
+  autocapitalize: 'none',
+  spellcheck: 'false',
+  style: loginInputInlineStyle,
+}
+
 const redirectTarget = computed(() => {
   const value = route.query.redirect
   return typeof value === 'string' && value.startsWith('/') ? value : '/'
-})
-
-onMounted(async () => {
-  try {
-    await ensureSessionLoaded(true)
-    if (state.user) {
-      await router.replace(redirectTarget.value)
-    }
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : '初始化登录状态失败')
-  }
 })
 
 async function handleLogin() {
@@ -58,7 +72,7 @@ async function handleLogin() {
             <defs>
               <linearGradient id="hostdeck-grad-small" x1="0%" y1="0%" x2="100%" y2="100%">
                 <stop offset="0%" stop-color="#2dd4bf" />
-                <stop offset="100%" stop-color="#34d399" />
+                <stop offset="100%" stop-color="var(--app-accent)" />
               </linearGradient>
             </defs>
             <path d="M12 3 L 6 13 H 18 Z" />
@@ -77,7 +91,7 @@ async function handleLogin() {
               <defs>
                 <linearGradient id="hostdeck-grad-large" x1="0%" y1="0%" x2="100%" y2="100%">
                   <stop offset="0%" stop-color="#2dd4bf" />
-                  <stop offset="100%" stop-color="#34d399" />
+                  <stop offset="100%" stop-color="var(--app-accent)" />
                 </linearGradient>
               </defs>
               <path d="M12 3 L 6 13 H 18 Z" />
@@ -108,6 +122,7 @@ async function handleLogin() {
               v-model:value="model.username"
               placeholder=""
               class="dark-input"
+              :input-props="usernameInputProps"
               :disabled="!state.systemInitialized"
               @keyup.enter="handleLogin"
             />
@@ -120,6 +135,7 @@ async function handleLogin() {
               show-password-on="click"
               placeholder=""
               class="dark-input"
+              :input-props="passwordInputProps"
               :disabled="!state.systemInitialized"
               @keyup.enter="handleLogin"
             />
@@ -132,7 +148,7 @@ async function handleLogin() {
           <n-button
             block
             size="large"
-            class="login-btn solid-green-btn"
+            class="login-btn solid-blue-btn"
             :loading="state.authenticating"
             :disabled="!state.systemInitialized"
             @click="handleLogin"
@@ -152,21 +168,49 @@ async function handleLogin() {
   overflow: hidden;
   display: flex;
   align-items: center;
-  justify-content: center;
-  background-color: #0b0e14;
+  justify-content: flex-end;
+  background: #020811;
   font-family: 'Inter', 'PingFang SC', sans-serif;
-  color: #fff;
+  color: var(--app-text);
+  -webkit-text-size-adjust: 100%;
+}
+
+.login-wrapper::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: var(--app-background-overlay), var(--app-background-image);
+  background-size: var(--app-background-size);
+  background-position: var(--app-background-position);
+  background-repeat: var(--app-background-repeat);
+}
+
+.login-wrapper::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 11% 64%, rgba(28, 230, 229, 0.1), transparent 18%),
+    radial-gradient(circle at 79% 78%, rgba(28, 230, 229, 0.08), transparent 20%),
+    linear-gradient(120deg, transparent 0 42%, rgba(36, 214, 255, 0.055) 48%, transparent 54% 100%);
+  opacity: 0.54;
+  animation: light-sweep 8s ease-in-out infinite;
+  pointer-events: none;
 }
 
 .login-grid {
   position: absolute;
   inset: 0;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
-  background-size: 60px 60px;
-  z-index: 0;
+  background:
+    radial-gradient(circle, rgba(30, 230, 230, 0.46) 0 1.5px, transparent 2px),
+    linear-gradient(rgba(62, 111, 160, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(62, 111, 160, 0.05) 1px, transparent 1px);
+  background-size: 360px 220px, 58px 58px, 58px 58px;
+  background-position: 0 0, center, center;
+  opacity: 0.28;
+  z-index: 1;
   pointer-events: none;
+  animation: particle-drift 14s linear infinite;
 }
 
 .top-nav {
@@ -187,31 +231,33 @@ async function handleLogin() {
   display: flex;
   align-items: center;
   justify-content: center;
-  filter: drop-shadow(0 0 8px rgba(45, 212, 191, 0.6));
+  filter: drop-shadow(0 0 10px rgba(32, 212, 255, 0.65));
 }
 
 .brand-text {
   font-size: 20px;
   font-weight: 700;
-  letter-spacing: -0.5px;
-  color: #fff;
-  text-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
+  letter-spacing: 0;
+  color: var(--app-text);
+  text-shadow: 0 0 14px rgba(32, 212, 255, 0.2);
 }
 
 .login-container {
   position: relative;
   z-index: 10;
   width: 100%;
-  max-width: 420px;
+  max-width: 430px;
+  margin-right: clamp(32px, 9vw, 154px);
   padding: 0 20px;
 }
 
 .login-card {
-  background-color: #12151c;
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 24px;
-  padding: 48px 40px;
-  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4);
+  background: linear-gradient(180deg, rgba(12, 25, 43, 0.72), rgba(7, 17, 31, 0.82));
+  border: 1px solid rgba(78, 119, 170, 0.26);
+  border-radius: 8px;
+  padding: 42px 38px;
+  box-shadow: 0 24px 60px rgba(0, 8, 22, 0.54), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  backdrop-filter: saturate(125%);
 }
 
 .login-header {
@@ -224,20 +270,20 @@ async function handleLogin() {
   display: flex;
   align-items: center;
   justify-content: center;
-  filter: drop-shadow(0 0 24px rgba(45, 212, 191, 0.8));
+  filter: drop-shadow(0 0 26px rgba(32, 212, 255, 0.72));
 }
 
 .login-header h2 {
   margin: 0 0 12px;
-  color: #fff;
+  color: var(--app-text);
   font-size: 24px;
   font-weight: 700;
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
 }
 
 .login-header p {
   margin: 0;
-  color: #71717a;
+  color: var(--app-text-faint);
   font-size: 14px;
 }
 
@@ -246,22 +292,86 @@ async function handleLogin() {
 }
 
 :deep(.n-form-item-label) {
-  color: #ededed !important;
+  color: var(--app-text) !important;
   font-weight: 600;
   font-size: 14px;
   padding-bottom: 8px !important;
 }
 
 :deep(.dark-input) {
-  --n-color: #242936 !important;
-  --n-color-focus: #2d3342 !important;
-  --n-border: 1px solid transparent !important;
-  --n-border-hover: 1px solid rgba(16, 185, 129, 0.5) !important;
-  --n-border-focus: 1px solid #10b981 !important;
-  --n-text-color: #fff !important;
-  --n-caret-color: #10b981 !important;
-  --n-border-radius: 8px !important;
+  --n-color: rgba(12, 24, 42, 0.9) !important;
+  --n-color-focus: rgba(15, 32, 55, 0.96) !important;
+  --n-border: 1px solid rgba(83, 112, 153, 0.26) !important;
+  --n-border-hover: 1px solid rgba(79, 131, 255, 0.58) !important;
+  --n-border-focus: 1px solid var(--app-accent-strong) !important;
+  --n-text-color: var(--app-text) !important;
+  --n-caret-color: var(--app-accent-strong) !important;
+  --n-border-radius: var(--app-radius-sm) !important;
+  --n-font-size: 16px !important;
+  --n-font-weight: 500 !important;
   --n-height: 48px !important;
+  --n-padding-left: 16px !important;
+  --n-padding-right: 16px !important;
+  font-size: 16px !important;
+  font-weight: 500 !important;
+  line-height: 48px !important;
+  font-family: 'Inter', 'Segoe UI', 'PingFang SC', sans-serif !important;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+:deep(.login-form .n-input),
+:deep(.login-form .n-input--focus),
+:deep(.login-form .n-input--active) {
+  font-size: 16px !important;
+  font-weight: 500 !important;
+  line-height: 48px !important;
+  font-family: 'Inter', 'Segoe UI', 'PingFang SC', sans-serif !important;
+}
+
+:deep(.dark-input .n-input-wrapper) {
+  min-height: 48px !important;
+  height: 48px !important;
+  transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease !important;
+}
+
+:deep(.dark-input .n-input__input),
+:deep(.dark-input .n-input__input-el),
+:deep(.dark-input .n-input__placeholder) {
+  height: 48px !important;
+  min-height: 48px !important;
+  font-size: 16px !important;
+  font-weight: 500 !important;
+  line-height: 48px !important;
+  font-family: 'Inter', 'Segoe UI', 'PingFang SC', sans-serif !important;
+  transform: none !important;
+  letter-spacing: 0 !important;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+:deep(.dark-input .n-input__input-el),
+:deep(.dark-input .n-input__input-el:hover),
+:deep(.dark-input .n-input__input-el:focus),
+:deep(.dark-input .n-input__input-el:active),
+:deep(.dark-input .n-input__input-el:disabled) {
+  font-size: 16px !important;
+  font-weight: 500 !important;
+  line-height: 48px !important;
+  font-family: 'Inter', 'Segoe UI', 'PingFang SC', sans-serif !important;
+  transform: none !important;
+}
+
+:deep(.dark-input .n-input__input-el::first-line),
+:deep(.dark-input .n-input__input-el:focus::first-line),
+:deep(.dark-input .n-input__input-el:-webkit-autofill::first-line),
+:deep(.dark-input .n-input__input-el:-webkit-autofill:hover::first-line),
+:deep(.dark-input .n-input__input-el:-webkit-autofill:focus::first-line),
+:deep(.dark-input .n-input__input-el:-webkit-autofill:active::first-line) {
+  font-family: 'Inter', 'Segoe UI', 'PingFang SC', sans-serif !important;
+  font-size: 16px !important;
+  font-weight: 500 !important;
+  line-height: 48px !important;
 }
 
 :deep(.dark-input .n-input__input-el:-webkit-autofill),
@@ -270,6 +380,12 @@ async function handleLogin() {
 :deep(.dark-input .n-input__input-el:-webkit-autofill:active) {
   -webkit-transition-delay: 99999s;
   -webkit-transition: color 99999s ease-out, background-color 99999s ease-out;
+  -webkit-text-fill-color: var(--app-text) !important;
+  caret-color: var(--app-accent-strong) !important;
+  font-family: 'Inter', 'Segoe UI', 'PingFang SC', sans-serif !important;
+  font-size: 16px !important;
+  font-weight: 500 !important;
+  line-height: 48px !important;
 }
 
 .form-actions {
@@ -280,25 +396,72 @@ async function handleLogin() {
 }
 
 :deep(.custom-checkbox) {
-  --n-text-color: #a1a1aa !important;
+  --n-text-color: var(--app-text-soft) !important;
   --n-font-size: 14px !important;
-  --n-color-checked: #10b981 !important;
-  --n-border-checked: 1px solid #10b981 !important;
+  --n-color-checked: var(--app-accent-strong) !important;
+  --n-border-checked: 1px solid var(--app-accent-strong) !important;
 }
 
-.solid-green-btn {
+.solid-blue-btn {
   height: 48px;
-  border-radius: 8px;
+  border-radius: var(--app-radius-sm);
   font-size: 16px;
   font-weight: 600;
-  background-color: #10b981 !important;
+  background-color: var(--app-accent-strong) !important;
   border: none !important;
-  color: #fff !important;
+  color: var(--app-text) !important;
   transition: all 0.2s ease;
 }
 
-.solid-green-btn:hover {
-  background-color: #0ea5e9 !important;
+.solid-blue-btn:hover {
+  background-color: #356fe8 !important;
   transform: translateY(-1px);
+}
+
+@keyframes particle-drift {
+  from {
+    background-position: 0 0, center, center;
+  }
+  to {
+    background-position: 360px 220px, calc(50% + 18px) calc(50% + 12px), calc(50% + 18px) calc(50% + 12px);
+  }
+}
+
+@keyframes light-sweep {
+  0%,
+  100% {
+    opacity: 0.48;
+  }
+  50% {
+    opacity: 0.78;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-wrapper::after,
+  .login-grid {
+    animation: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .login-wrapper {
+    justify-content: center;
+  }
+
+  .login-container {
+    margin-right: 0;
+    margin-top: 72px;
+  }
+}
+
+@media (max-width: 560px) {
+  .top-nav {
+    padding: 22px 24px;
+  }
+
+  .login-card {
+    padding: 34px 24px;
+  }
 }
 </style>

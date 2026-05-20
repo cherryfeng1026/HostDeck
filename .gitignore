@@ -1,6 +1,7 @@
 .tools/
 .cache/
 data/
+logs/
 server/bin/
 server/tmp/
 server/.air/
@@ -8,12 +9,25 @@ server/coverage.out
 server/config/config.yaml
 web/node_modules/
 web/dist/
-*.db
-*.sqlite
-*.sqlite3
+web/playwright/.auth/
+web/playwright-report/
+web/test-results/
 .env
 .env.local
-.superpowers/
+hostdeck-e2e.env
 .idea/
 .vscode/
 .DS_Store
+.ace-tool/
+
+# Local AI/agent workspace files
+.claude/
+.codex/
+.gemini/
+.trellis/
+.playwright-mcp/
+skills/
+AGENTS.md
+
+# Local screenshots/artifacts
+servers-final.png

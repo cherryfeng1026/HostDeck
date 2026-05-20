@@ -7,11 +7,12 @@ import (
 )
 
 type ServerCredential struct {
-	ServerID           int64
-	AuthType           string
-	PasswordCiphertext string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ServerID             int64
+	AuthType             string
+	PasswordCiphertext   string
+	PrivateKeyCiphertext string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 type ServerCredentialRepository struct {
@@ -27,11 +28,12 @@ func (r *ServerCredentialRepository) UpsertPassword(ctx context.Context, serverI
 	_, err := r.db.ExecContext(
 		ctx,
 		`INSERT INTO server_credentials (
-			server_id, auth_type, password_ciphertext, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5)
+			server_id, auth_type, password_ciphertext, private_key_ciphertext, created_at, updated_at
+		) VALUES ($1, $2, $3, '', $4, $5)
 		ON CONFLICT (server_id) DO UPDATE SET
 			auth_type = excluded.auth_type,
 			password_ciphertext = excluded.password_ciphertext,
+			private_key_ciphertext = '',
 			updated_at = excluded.updated_at`,
 		serverID,
 		authType,
@@ -51,11 +53,11 @@ func (r *ServerCredentialRepository) GetByServerID(ctx context.Context, serverID
 
 	err := r.db.QueryRowContext(
 		ctx,
-		`SELECT server_id, auth_type, password_ciphertext, created_at, updated_at
+		`SELECT server_id, auth_type, password_ciphertext, private_key_ciphertext, created_at, updated_at
 		FROM server_credentials
 		WHERE server_id = $1`,
 		serverID,
-	).Scan(&item.ServerID, &item.AuthType, &item.PasswordCiphertext, &createdAt, &updatedAt)
+	).Scan(&item.ServerID, &item.AuthType, &item.PasswordCiphertext, &item.PrivateKeyCiphertext, &createdAt, &updatedAt)
 	if err != nil {
 		return ServerCredential{}, err
 	}

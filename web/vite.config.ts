@@ -3,6 +3,9 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
   plugins: [vue()],
+  resolve: {
+    extensions: ['.mjs', '.mts', '.ts', '.js', '.jsx', '.tsx', '.json'],
+  },
   server: {
     proxy: {
       '/api': {

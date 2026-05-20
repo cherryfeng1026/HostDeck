@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+
 	"hostdeck/server/internal/domain"
 	"hostdeck/server/internal/storage"
 )
@@ -85,8 +87,86 @@ func TestMigrate_CommandLogsExecutedAtTextUpgradesToTimestamptz(t *testing.T) {
 	if items[0].Command != "cmd-2" || items[1].Command != "cmd-1" {
 		t.Fatalf("expected migrated rows in desc order, got %+v", items)
 	}
-	if !items[0].ExecutedAt.Equal(base.Add(100 * time.Millisecond)) || !items[1].ExecutedAt.Equal(base) {
+	if !items[0].ExecutedAt.Equal(base.Add(100*time.Millisecond)) || !items[1].ExecutedAt.Equal(base) {
 		t.Fatalf("expected subsecond precision to be preserved, got %+v", items)
+	}
+}
+
+func TestMigrate_CreatesServerStatusHistoryIndexes(t *testing.T) {
+	db := openMigrationTestDB(t)
+	ctx := context.Background()
+
+	if err := storage.Migrate(ctx, db); err != nil {
+		t.Fatalf("migrate schema: %v", err)
+	}
+	if err := storage.Migrate(ctx, db); err != nil {
+		t.Fatalf("migrate schema twice: %v", err)
+	}
+
+	for _, indexName := range []string{
+		"idx_server_status_history_sampled_at",
+		"idx_server_status_history_server_sampled_at",
+	} {
+		var exists bool
+		if err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_indexes
+				WHERE schemaname = current_schema() AND indexname = $1
+			)
+		`, indexName).Scan(&exists); err != nil {
+			t.Fatalf("query index %s: %v", indexName, err)
+		}
+		if !exists {
+			t.Fatalf("expected index %s to exist", indexName)
+		}
+	}
+}
+
+func TestMigrate_AddsAlertRuleScopeAndNotificationDeliveries(t *testing.T) {
+	db := openMigrationTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 22, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano)
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create schema_migrations: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE alert_rules (
+			id BIGSERIAL PRIMARY KEY,
+			metric TEXT NOT NULL,
+			operator TEXT NOT NULL,
+			threshold DOUBLE PRECISION NOT NULL,
+			duration_seconds INTEGER NOT NULL DEFAULT 60,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`); err != nil {
+		t.Fatalf("create legacy alert_rules: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO alert_rules (metric, operator, threshold, duration_seconds, enabled, created_at, updated_at) VALUES ('memory_usage', 'gte', 80, 60, 1, $1, $1)`, now); err != nil {
+		t.Fatalf("insert legacy alert rule: %v", err)
+	}
+	for version := int64(1); version <= 18; version++ {
+		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES ($1, CURRENT_TIMESTAMP::text)`, version); err != nil {
+			t.Fatalf("seed schema version %d: %v", version, err)
+		}
+	}
+
+	if err := storage.Migrate(ctx, db); err != nil {
+		t.Fatalf("migrate legacy alert schema: %v", err)
+	}
+
+	var scopeType, scopeValue string
+	if err := db.QueryRowContext(ctx, `SELECT scope_type, scope_value FROM alert_rules WHERE id = 1`).Scan(&scopeType, &scopeValue); err != nil {
+		t.Fatalf("query migrated alert rule scope: %v", err)
+	}
+	if scopeType != domain.AlertRuleScopeAll || scopeValue != "" {
+		t.Fatalf("unexpected migrated scope: type=%q value=%q", scopeType, scopeValue)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO alert_notification_deliveries (event_type, payload, occurred_at, created_at, updated_at) VALUES ($1, $2, $3, $3, $3)`, domain.AlertEventTest, `{}`, now); err != nil {
+		t.Fatalf("expected notification deliveries table to exist: %v", err)
 	}
 }
 
@@ -174,9 +254,13 @@ func openMigrationTestDB(t *testing.T) *sql.DB {
 	}
 
 	ctx := context.Background()
-	adminDB, err := storage.Open(ctx, dsn)
+	adminDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open admin postgres db: %v", err)
+	}
+	if err := adminDB.PingContext(ctx); err != nil {
+		_ = adminDB.Close()
+		t.Fatalf("ping admin postgres db: %v", err)
 	}
 	schemaName := fmt.Sprintf("hostdeck_migrate_test_%d", time.Now().UTC().UnixNano())
 	if _, err := adminDB.ExecContext(ctx, `CREATE SCHEMA `+schemaName); err != nil {

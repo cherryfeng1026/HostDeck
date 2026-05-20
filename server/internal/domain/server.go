@@ -23,12 +23,15 @@ type Server struct {
 	Username                  string     `json:"username"`
 	AuthType                  string     `json:"authType"`
 	PasswordConfigured        bool       `json:"passwordConfigured"`
+	PrivateKeyConfigured      bool       `json:"privateKeyConfigured"`
 	TrustedHostKeyFingerprint string     `json:"trustedHostKeyFingerprint"`
 	Password                  string     `json:"-"`
+	PrivateKey                string     `json:"-"`
 	CollectorMode             string     `json:"collectorMode"`
 	Tags                      []string   `json:"tags"`
 	Purpose                   string     `json:"purpose"`
 	Remark                    string     `json:"remark"`
+	ExpiresAt                 *time.Time `json:"expiresAt,omitempty"`
 	MaintenanceStartAt        *time.Time `json:"maintenanceStartAt,omitempty"`
 	MaintenanceEndAt          *time.Time `json:"maintenanceEndAt,omitempty"`
 	Enabled                   bool       `json:"enabled"`

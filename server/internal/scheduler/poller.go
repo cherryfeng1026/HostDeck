@@ -21,10 +21,18 @@ type ServerResolver interface {
 type StatusWriter interface {
 	UpsertLatest(ctx context.Context, serverID int64, snapshot collector.Snapshot, sampledAt time.Time) error
 	AppendHistory(ctx context.Context, serverID int64, snapshot collector.Snapshot, sampledAt time.Time) error
+	MarkCollectStarted(ctx context.Context, serverID int64, startedAt time.Time) error
+	MarkCollectFailure(ctx context.Context, serverID int64, err error, finishedAt time.Time) error
+	MarkDisabled(ctx context.Context, serverID int64, finishedAt time.Time) error
+	MarkStaleBefore(ctx context.Context, cutoff time.Time) error
 }
 
 type AlertEvaluator interface {
 	EvaluateServerSnapshot(ctx context.Context, server domain.Server, snapshot collector.Snapshot, sampledAt time.Time) error
+}
+
+type DisabledAlertResolver interface {
+	ResolveServerAlerts(ctx context.Context, server domain.Server, detail string, occurredAt time.Time) error
 }
 
 type Poller struct {
@@ -80,11 +88,16 @@ func (p *Poller) collectOnce(ctx context.Context) {
 		return
 	}
 
+	sampledAt := time.Now().UTC()
 	sem := make(chan struct{}, p.concurrency)
 	var wg sync.WaitGroup
 
 	for _, server := range servers {
 		if !server.Enabled {
+			_ = p.statuses.MarkDisabled(ctx, server.ID, sampledAt)
+			if resolver, ok := p.alerts.(DisabledAlertResolver); ok {
+				_ = resolver.ResolveServerAlerts(ctx, server, "server disabled", sampledAt)
+			}
 			continue
 		}
 
@@ -100,22 +113,33 @@ func (p *Poller) collectOnce(ctx context.Context) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			_ = p.statuses.MarkCollectStarted(ctx, server.ID, sampledAt)
 			resolvedServer, err := p.resolver.ResolveServer(ctx, server.ID)
-			if err != nil || !resolvedServer.Enabled {
+			if err != nil {
+				_ = p.statuses.MarkCollectFailure(ctx, server.ID, err, time.Now().UTC())
+				return
+			}
+			if !resolvedServer.Enabled {
+				_ = p.statuses.MarkDisabled(ctx, server.ID, time.Now().UTC())
 				return
 			}
 			snapshot, err := p.collector.Collect(ctx, resolvedServer)
 			if err != nil {
+				finishedAt := time.Now().UTC()
+				_ = p.statuses.MarkCollectFailure(ctx, server.ID, err, finishedAt)
+				if p.alerts != nil {
+					_ = p.alerts.EvaluateServerSnapshot(ctx, resolvedServer, collector.Snapshot{Online: false, SSHOK: false, Source: "ssh"}, finishedAt)
+				}
 				return
 			}
-			now := time.Now()
-			_ = p.statuses.UpsertLatest(ctx, server.ID, snapshot, now)
-			_ = p.statuses.AppendHistory(ctx, server.ID, snapshot, now)
+			_ = p.statuses.UpsertLatest(ctx, server.ID, snapshot, sampledAt)
+			_ = p.statuses.AppendHistory(ctx, server.ID, snapshot, sampledAt)
 			if p.alerts != nil {
-				_ = p.alerts.EvaluateServerSnapshot(ctx, resolvedServer, snapshot, now)
+				_ = p.alerts.EvaluateServerSnapshot(ctx, resolvedServer, snapshot, sampledAt)
 			}
 		}(server)
 	}
 
 	wg.Wait()
+	_ = p.statuses.MarkStaleBefore(ctx, sampledAt.Add(-p.interval*2))
 }

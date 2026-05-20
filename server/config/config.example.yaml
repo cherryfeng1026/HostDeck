@@ -1,15 +1,63 @@
+# HostDeck 示例配置。
+# 使用前复制为 server/config/config.yaml，并替换成真实配置。
+# 不要提交 server/config/config.yaml，因为里面会包含数据库地址、密钥等敏感信息。
+
+# 监听地址（选配）。
+# 为空或不配置时，默认使用 :18080。
 http_addr: ":18080"
+
+# 数据库 DSN（必填）。
+# 使用 PostgreSQL / Neon，也可以通过环境变量 HOSTDECK_DB_DSN 或 DATABASE_URL 覆盖。
 db_dsn: "postgresql://user:password@localhost:5432/hostdeck?sslmode=require"
+
+# 加密主密钥（生产环境必填，SSH 凭据和 Webhook 密钥会用到）。
+# 不能使用 "change-me"，请改成足够长的随机字符串，并长期备份。
+# 丢失或更换该密钥后，已保存的 SSH 凭据和 Webhook 密钥将无法解密。
+master_key: "replace-with-a-long-random-secret"
+
+# 启动时自动创建初始管理员（选配）。
+# 同时填写用户名和密码时，首次启动会自动创建管理员。
+# 如果想通过初始化接口创建管理员，可以保持这两项为空。
 bootstrap_admin_username: ""
 bootstrap_admin_password: ""
+
+# 初始化接口令牌（选配）。
+# 设置后，可通过 /api/auth/bootstrap-admin 携带该令牌创建第一个管理员。
+# 为空时禁用初始化接口。
 bootstrap_admin_token: ""
-master_key: "change-me"
+
+# 会话 Cookie 设置（选配）。
+# 只有在站点使用 HTTPS 访问时，才建议开启 session_cookie_secure。
 session_cookie_name: "hostdeck_session"
 session_cookie_secure: false
 session_ttl_hours: 24
+
+# 前端静态文件目录（部署时必须确认）。
+# 本地运行 server/config/config.yaml 时使用 "../../web/dist"。
+# Docker 容器内 /app/config.yaml 对应使用 "/app/web/dist"。
 web_dist_dir: "../../web/dist"
+
+# 文件日志（选配）。
+# log_file 为空时只输出到标准输出。
+# Docker 日志挂载路径建议使用 "/app/logs/hostdeck.log"。
+log_file: ""
+
+# 日志级别和日志轮转（选配）。
+# log_level 只能是 debug、info、warn、error 之一。
+# 只有 log_file 不为空时，日志轮转配置才会生效。
+log_level: "info"
+log_max_size_mb: 50
+log_max_backups: 14
+log_max_age_days: 14
+log_compress: true
+
+# SSH 采集调度（选配）。
+# 控制 HostDeck 多久采集一次服务器状态，以及每次并发采集多少台服务器。
 poll_interval_seconds: 60
 poll_concurrency: 5
+
+# 清理任务和历史数据保留时间（选配）。
+# 除 cleanup_interval_seconds 外，其余保留时间单位都是小时。
 cleanup_interval_seconds: 3600
 status_history_retention_hours: 720
 command_log_retention_hours: 720
@@ -17,5 +65,9 @@ alert_history_retention_hours: 2160
 auth_event_retention_hours: 2160
 audit_event_retention_hours: 2160
 api_token_retention_hours: 720
+
+# 告警 Webhook 默认配置（选配）。
+# 不需要 Webhook 通知时，保持 alert_webhook_url 为空。
+# 如果配置了 alert_webhook_url，也必须配置 master_key。
 alert_webhook_url: ""
 alert_webhook_timeout_seconds: 5

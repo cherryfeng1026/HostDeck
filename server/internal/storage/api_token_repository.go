@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"strings"
 	"time"
 
 	"hostdeck/server/internal/domain"
@@ -21,7 +23,11 @@ func NewAPITokenRepository(db *sql.DB) *APITokenRepository {
 	return &APITokenRepository{db: db}
 }
 
-func (r *APITokenRepository) Create(ctx context.Context, userID int64, name string, tokenHash string, prefix string, expiresAt *time.Time, now time.Time) (domain.APIToken, error) {
+func (r *APITokenRepository) Create(ctx context.Context, userID int64, name string, tokenHash string, prefix string, scopes []string, expiresAt *time.Time, now time.Time) (domain.APIToken, error) {
+	scopesJSON, err := json.Marshal(normalizeAPITokenScopes(scopes))
+	if err != nil {
+		return domain.APIToken{}, err
+	}
 	timestamp := now.UTC().Format(time.RFC3339Nano)
 	expiresAtValue := ""
 	if expiresAt != nil && !expiresAt.IsZero() {
@@ -30,13 +36,14 @@ func (r *APITokenRepository) Create(ctx context.Context, userID int64, name stri
 
 	row := r.db.QueryRowContext(
 		ctx,
-		`INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, last_used_at, expires_at, created_at, updated_at, revoked_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		 RETURNING id, user_id, name, token_prefix, last_used_at, expires_at, created_at, updated_at, revoked_at`,
+		`INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, scopes, last_used_at, expires_at, created_at, updated_at, revoked_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		 RETURNING id, user_id, name, token_prefix, scopes, last_used_at, expires_at, created_at, updated_at, revoked_at`,
 		userID,
 		name,
 		tokenHash,
 		prefix,
+		string(scopesJSON),
 		"",
 		expiresAtValue,
 		timestamp,
@@ -50,7 +57,7 @@ func (r *APITokenRepository) ListActiveByUserID(ctx context.Context, userID int6
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	rows, err := r.db.QueryContext(
 		ctx,
-		`SELECT id, user_id, name, token_prefix, last_used_at, expires_at, created_at, updated_at, revoked_at
+		`SELECT id, user_id, name, token_prefix, scopes, last_used_at, expires_at, created_at, updated_at, revoked_at
 		   FROM api_tokens
 		  WHERE user_id = $1 AND revoked_at = '' AND (expires_at = '' OR expires_at > $2)
 		  ORDER BY created_at DESC`,
@@ -76,7 +83,7 @@ func (r *APITokenRepository) ListActiveByUserID(ctx context.Context, userID int6
 func (r *APITokenRepository) GetByID(ctx context.Context, id int64) (APITokenRecord, error) {
 	row := r.db.QueryRowContext(
 		ctx,
-		`SELECT id, user_id, name, token_hash, token_prefix, last_used_at, expires_at, created_at, updated_at, revoked_at
+		`SELECT id, user_id, name, token_hash, token_prefix, scopes, last_used_at, expires_at, created_at, updated_at, revoked_at
 		   FROM api_tokens
 		  WHERE id = $1`,
 		id,
@@ -87,7 +94,7 @@ func (r *APITokenRepository) GetByID(ctx context.Context, id int64) (APITokenRec
 func (r *APITokenRepository) GetByTokenHash(ctx context.Context, tokenHash string) (APITokenRecord, error) {
 	row := r.db.QueryRowContext(
 		ctx,
-		`SELECT id, user_id, name, token_hash, token_prefix, last_used_at, expires_at, created_at, updated_at, revoked_at
+		`SELECT id, user_id, name, token_hash, token_prefix, scopes, last_used_at, expires_at, created_at, updated_at, revoked_at
 		   FROM api_tokens
 		  WHERE token_hash = $1`,
 		tokenHash,
@@ -135,6 +142,7 @@ func (r *APITokenRepository) DeleteExpiredOrRevokedBefore(ctx context.Context, c
 func scanAPITokenRecord(scanner interface{ Scan(dest ...any) error }) (APITokenRecord, error) {
 	var (
 		record     APITokenRecord
+		scopes     string
 		lastUsedAt string
 		expiresAt  string
 		createdAt  string
@@ -148,6 +156,7 @@ func scanAPITokenRecord(scanner interface{ Scan(dest ...any) error }) (APITokenR
 		&record.Name,
 		&record.TokenHash,
 		&record.Prefix,
+		&scopes,
 		&lastUsedAt,
 		&expiresAt,
 		&createdAt,
@@ -156,7 +165,7 @@ func scanAPITokenRecord(scanner interface{ Scan(dest ...any) error }) (APITokenR
 	); err != nil {
 		return APITokenRecord{}, err
 	}
-	if err := fillAPIToken(&record.APIToken, lastUsedAt, expiresAt, createdAt, updatedAt, revokedAt); err != nil {
+	if err := fillAPIToken(&record.APIToken, scopes, lastUsedAt, expiresAt, createdAt, updatedAt, revokedAt); err != nil {
 		return APITokenRecord{}, err
 	}
 	return record, nil
@@ -165,6 +174,7 @@ func scanAPITokenRecord(scanner interface{ Scan(dest ...any) error }) (APITokenR
 func scanAPIToken(scanner interface{ Scan(dest ...any) error }) (domain.APIToken, error) {
 	var (
 		item       domain.APIToken
+		scopes     string
 		lastUsedAt string
 		expiresAt  string
 		createdAt  string
@@ -177,6 +187,7 @@ func scanAPIToken(scanner interface{ Scan(dest ...any) error }) (domain.APIToken
 		&item.UserID,
 		&item.Name,
 		&item.Prefix,
+		&scopes,
 		&lastUsedAt,
 		&expiresAt,
 		&createdAt,
@@ -185,13 +196,42 @@ func scanAPIToken(scanner interface{ Scan(dest ...any) error }) (domain.APIToken
 	); err != nil {
 		return domain.APIToken{}, err
 	}
-	if err := fillAPIToken(&item, lastUsedAt, expiresAt, createdAt, updatedAt, revokedAt); err != nil {
+	if err := fillAPIToken(&item, scopes, lastUsedAt, expiresAt, createdAt, updatedAt, revokedAt); err != nil {
 		return domain.APIToken{}, err
 	}
 	return item, nil
 }
 
-func fillAPIToken(item *domain.APIToken, lastUsedAt string, expiresAt string, createdAt string, updatedAt string, revokedAt string) error {
+func normalizeAPITokenScopes(scopes []string) []string {
+	seen := map[string]struct{}{}
+	items := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		if _, ok := seen[scope]; ok {
+			continue
+		}
+		seen[scope] = struct{}{}
+		items = append(items, scope)
+	}
+	if len(items) == 0 {
+		return []string{domain.ScopeAll}
+	}
+	return items
+}
+
+func normalizeAPITokenScopesFromJSON(raw string) []string {
+	var scopes []string
+	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &scopes) != nil {
+		return []string{domain.ScopeAll}
+	}
+	return normalizeAPITokenScopes(scopes)
+}
+
+func fillAPIToken(item *domain.APIToken, scopes string, lastUsedAt string, expiresAt string, createdAt string, updatedAt string, revokedAt string) error {
+	item.Scopes = normalizeAPITokenScopesFromJSON(scopes)
 	created, err := time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
 		return err

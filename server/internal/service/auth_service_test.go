@@ -105,6 +105,24 @@ func TestLoginReturnsSystemUninitializedWhenNoUsers(t *testing.T) {
 	}
 }
 
+func TestCreateInitialAdminClearsUninitializedCache(t *testing.T) {
+	db := openAuthServiceTestDB(t)
+	authService := newAuthServiceForTest(db)
+
+	_, _, _, err := authService.Login(context.Background(), "admin", "admin123", "127.0.0.1", "test")
+	if !errors.Is(err, service.ErrSystemUninitialized) {
+		t.Fatalf("expected ErrSystemUninitialized, got %v", err)
+	}
+
+	if _, err := authService.CreateInitialAdmin(context.Background(), "admin", "admin123", "127.0.0.1", "test", "test"); err != nil {
+		t.Fatalf("create initial admin: %v", err)
+	}
+
+	if _, _, _, err := authService.Login(context.Background(), "admin", "admin123", "127.0.0.1", "test"); err != nil {
+		t.Fatalf("login after initial admin creation: %v", err)
+	}
+}
+
 func TestCreateUserAndListUsers(t *testing.T) {
 	db := openAuthServiceTestDB(t)
 	authService := newAuthServiceForTest(db)
@@ -185,7 +203,7 @@ func TestListAPITokensHidesExpiredTokens(t *testing.T) {
 		t.Fatalf("create initial admin: %v", err)
 	}
 
-	if _, _, err := authService.CreateAPIToken(context.Background(), admin, "expired", 1, "127.0.0.1", "test"); err != nil {
+	if _, _, err := authService.CreateAPIToken(context.Background(), admin, "expired", 1, []string{domain.ScopeAll}, "127.0.0.1", "test"); err != nil {
 		t.Fatalf("create api token: %v", err)
 	}
 

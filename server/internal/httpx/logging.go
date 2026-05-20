@@ -3,6 +3,7 @@ package httpx
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -43,8 +44,12 @@ func WithRequestLogging(next http.Handler) http.Handler {
 			"http request",
 			"method", r.Method,
 			"path", r.URL.Path,
+			"query", r.URL.RawQuery,
 			"status", status,
 			"durationMs", time.Since(startedAt).Milliseconds(),
+			"remoteAddr", strings.TrimSpace(r.RemoteAddr),
+			"userAgent", r.UserAgent(),
+			"referer", r.Referer(),
 		)
 	})
 }

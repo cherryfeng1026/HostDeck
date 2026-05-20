@@ -1,0 +1,16 @@
+services:
+  hostdeck:
+    build:
+      context: .
+    image: hostdeck:local
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./server/config/config.yaml:/app/config.yaml:ro
+      - ./logs/hostdeck:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

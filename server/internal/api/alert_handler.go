@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -56,9 +55,13 @@ func RegisterAlertWriteRoutes(r chi.Router, h *AlertHandler) {
 	}
 
 	r.Get("/api/alert-notification-settings", h.GetNotificationSettings)
+	r.Get("/api/alert-notification-deliveries", h.ListNotificationDeliveries)
 	r.Post("/api/alert-rules", h.CreateRule)
 	r.Put("/api/alert-rules/{id}", h.UpdateRule)
+	r.Delete("/api/alert-rules/{id}", h.DeleteRule)
 	r.Put("/api/alert-notification-settings", h.UpdateNotificationSettings)
+	r.Post("/api/alert-notification-settings/test", h.TestNotificationSettings)
+	r.Post("/api/alert-notification-deliveries/retry", h.RetryNotificationDeliveries)
 	r.Post("/api/alerts/{id}/ack", h.AcknowledgeAlert)
 	r.Post("/api/alerts/{id}/mute", h.MuteAlert)
 }
@@ -114,7 +117,7 @@ func (h *AlertHandler) GetNotificationSettings(w http.ResponseWriter, r *http.Re
 }
 
 func (h *AlertHandler) UpdateNotificationSettings(w http.ResponseWriter, r *http.Request) {
-	payload, err := decodeNotificationSettingsPayload(r)
+	payload, err := decodeJSON[notificationSettingsPayload](w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -143,14 +146,59 @@ func (h *AlertHandler) UpdateNotificationSettings(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, sanitizeNotificationSettings(settings))
 }
 
+func (h *AlertHandler) ListNotificationDeliveries(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseOptionalPositiveLimit(r, 20)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	items, err := h.service.ListNotificationDeliveries(r.Context(), r.URL.Query().Get("status"), limit)
+	if err != nil {
+		if errors.Is(err, service.ErrAlertNotificationDeliveryUnavailable) {
+			writeError(w, http.StatusInternalServerError, errors.New("通知投递记录不可用"))
+			return
+		}
+		if errors.Is(err, service.ErrInvalidNotificationDeliveryStatus) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (h *AlertHandler) TestNotificationSettings(w http.ResponseWriter, r *http.Request) {
+	user, _ := authctx.CurrentUser(r.Context())
+	if err := h.service.SendTestNotification(r.Context(), user.Username); err != nil {
+		writeNotificationDeliveryError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *AlertHandler) RetryNotificationDeliveries(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseOptionalPositiveLimit(r, 20)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	retried, err := h.service.RetryNotificationDeliveries(r.Context(), limit)
+	if err != nil {
+		writeNotificationDeliveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"retried": retried})
+}
+
 func (h *AlertHandler) CreateRule(w http.ResponseWriter, r *http.Request) {
-	rule, err := decodeAlertRulePayload(r, 0)
+	rule, err := decodeJSON[domain.AlertRule](w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	if err := h.service.CreateRule(r.Context(), rule); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeAlertRuleError(w, err)
 		return
 	}
 	if h.audit != nil {
@@ -173,13 +221,14 @@ func (h *AlertHandler) UpdateRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	rule, err := decodeAlertRulePayload(r, id)
+	rule, err := decodeJSON[domain.AlertRule](w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	rule.ID = id
 	if err := h.service.UpdateRule(r.Context(), rule); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeAlertRuleError(w, err)
 		return
 	}
 	if h.audit != nil {
@@ -189,6 +238,30 @@ func (h *AlertHandler) UpdateRule(w http.ResponseWriter, r *http.Request) {
 			Severity:  "info",
 			Title:     "更新告警规则",
 			Summary:   rule.Metric + " " + rule.Operator,
+			Username:  user.Username,
+			CreatedAt: time.Now().UTC(),
+		})
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *AlertHandler) DeleteRule(w http.ResponseWriter, r *http.Request) {
+	id, err := parseServerID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.service.DeleteRule(r.Context(), id); err != nil {
+		writeAlertRuleError(w, err)
+		return
+	}
+	if h.audit != nil {
+		user, _ := authctx.CurrentUser(r.Context())
+		_ = h.audit.Create(r.Context(), domain.AuditEvent{
+			Kind:      domain.AuditKindAlertRule,
+			Severity:  "info",
+			Title:     "删除告警规则",
+			Summary:   "规则已删除",
 			Username:  user.Username,
 			CreatedAt: time.Now().UTC(),
 		})
@@ -234,7 +307,7 @@ func (h *AlertHandler) MuteAlert(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, errors.New("请先登录"))
 		return
 	}
-	payload, err := decodeMuteAlertPayload(r)
+	payload, err := decodeJSON[muteAlertPayload](w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -262,38 +335,40 @@ func (h *AlertHandler) MuteAlert(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, item)
 }
 
-func decodeAlertRulePayload(r *http.Request, id int64) (domain.AlertRule, error) {
-	defer r.Body.Close()
-	var rule domain.AlertRule
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&rule); err != nil {
-		return domain.AlertRule{}, err
+func parseOptionalPositiveLimit(r *http.Request, defaultLimit int) (int, error) {
+	limit := defaultLimit
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return 0, errors.New("limit 参数无效")
+		}
+		limit = parsed
 	}
-	rule.ID = id
-	return rule, nil
+	return limit, nil
 }
 
-func decodeMuteAlertPayload(r *http.Request) (muteAlertPayload, error) {
-	defer r.Body.Close()
-	var payload muteAlertPayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
-		return muteAlertPayload{}, err
+func writeAlertRuleError(w http.ResponseWriter, err error) {
+	if errors.Is(err, service.ErrAlertRuleNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
 	}
-	return payload, nil
+	if errors.Is(err, service.ErrInvalidAlertRuleScope) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if errors.Is(err, service.ErrInvalidAlertRule) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }
 
-func decodeNotificationSettingsPayload(r *http.Request) (notificationSettingsPayload, error) {
-	defer r.Body.Close()
-	var payload notificationSettingsPayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
-		return notificationSettingsPayload{}, err
+func writeNotificationDeliveryError(w http.ResponseWriter, err error) {
+	if errors.Is(err, service.ErrAlertNotificationDeliveryUnavailable) {
+		writeError(w, http.StatusInternalServerError, errors.New("通知投递记录不可用"))
+		return
 	}
-	return payload, nil
+	writeError(w, http.StatusBadGateway, err)
 }
 
 func writeNotificationSettingsError(w http.ResponseWriter, err error) {

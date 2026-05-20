@@ -22,6 +22,12 @@ type Config struct {
 	SessionCookieSecure         bool   `yaml:"session_cookie_secure"`
 	SessionTTLHours             int    `yaml:"session_ttl_hours"`
 	WebDistDir                  string `yaml:"web_dist_dir"`
+	LogFile                     string `yaml:"log_file"`
+	LogLevel                    string `yaml:"log_level"`
+	LogMaxSizeMB                int    `yaml:"log_max_size_mb"`
+	LogMaxBackups               int    `yaml:"log_max_backups"`
+	LogMaxAgeDays               int    `yaml:"log_max_age_days"`
+	LogCompress                 bool   `yaml:"log_compress"`
 	PollIntervalSeconds         int    `yaml:"poll_interval_seconds"`
 	PollConcurrency             int    `yaml:"poll_concurrency"`
 	CleanupIntervalSeconds      int    `yaml:"cleanup_interval_seconds"`
@@ -67,10 +73,14 @@ func Load(configPath string) (Config, error) {
 
 	if baseDir != "" {
 		cfg.WebDistDir = resolveRelativePath(baseDir, cfg.WebDistDir)
+		cfg.LogFile = resolveRelativePath(baseDir, cfg.LogFile)
 		return cfg, nil
 	}
 
 	cfg.WebDistDir = filepath.Clean(cfg.WebDistDir)
+	if cfg.LogFile != "" {
+		cfg.LogFile = filepath.Clean(cfg.LogFile)
+	}
 	return cfg, nil
 }
 
@@ -85,6 +95,11 @@ func defaultConfig() Config {
 		SessionCookieSecure:         false,
 		SessionTTLHours:             24,
 		WebDistDir:                  "../web/dist",
+		LogLevel:                    "info",
+		LogMaxSizeMB:                50,
+		LogMaxBackups:               14,
+		LogMaxAgeDays:               14,
+		LogCompress:                 true,
 		PollIntervalSeconds:         60,
 		PollConcurrency:             5,
 		CleanupIntervalSeconds:      3600,
@@ -132,6 +147,12 @@ func applyEnvOverrides(cfg *Config) error {
 	}
 	if value := os.Getenv("HOSTDECK_WEB_DIST_DIR"); value != "" {
 		cfg.WebDistDir = value
+	}
+	if value := os.Getenv("HOSTDECK_LOG_FILE"); value != "" {
+		cfg.LogFile = value
+	}
+	if value := os.Getenv("HOSTDECK_LOG_LEVEL"); value != "" {
+		cfg.LogLevel = value
 	}
 	if value := os.Getenv("HOSTDECK_ALERT_WEBHOOK_URL"); value != "" {
 		cfg.AlertWebhookURL = value
@@ -181,6 +202,25 @@ func applyEnvOverrides(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	logMaxSizeMB, err := parseEnvInt("HOSTDECK_LOG_MAX_SIZE_MB", cfg.LogMaxSizeMB)
+	if err != nil {
+		return err
+	}
+	logMaxBackups, err := parseEnvInt("HOSTDECK_LOG_MAX_BACKUPS", cfg.LogMaxBackups)
+	if err != nil {
+		return err
+	}
+	logMaxAgeDays, err := parseEnvInt("HOSTDECK_LOG_MAX_AGE_DAYS", cfg.LogMaxAgeDays)
+	if err != nil {
+		return err
+	}
+	if value := os.Getenv("HOSTDECK_LOG_COMPRESS"); value != "" {
+		parsed, err := parseEnvBool("HOSTDECK_LOG_COMPRESS", value)
+		if err != nil {
+			return err
+		}
+		cfg.LogCompress = parsed
+	}
 
 	cfg.PollIntervalSeconds = interval
 	cfg.PollConcurrency = concurrency
@@ -193,6 +233,9 @@ func applyEnvOverrides(cfg *Config) error {
 	cfg.AuditEventRetentionHours = auditEventRetentionHours
 	cfg.APITokenRetentionHours = apiTokenRetentionHours
 	cfg.AlertWebhookTimeoutSeconds = alertWebhookTimeoutSeconds
+	cfg.LogMaxSizeMB = logMaxSizeMB
+	cfg.LogMaxBackups = logMaxBackups
+	cfg.LogMaxAgeDays = logMaxAgeDays
 	return nil
 }
 
@@ -214,6 +257,20 @@ func normalizeConfig(cfg *Config) {
 	cfg.AlertWebhookURL = strings.TrimSpace(cfg.AlertWebhookURL)
 	if strings.TrimSpace(cfg.WebDistDir) == "" {
 		cfg.WebDistDir = "../web/dist"
+	}
+	cfg.LogFile = strings.TrimSpace(cfg.LogFile)
+	cfg.LogLevel = strings.ToLower(strings.TrimSpace(cfg.LogLevel))
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	if cfg.LogMaxSizeMB <= 0 {
+		cfg.LogMaxSizeMB = 50
+	}
+	if cfg.LogMaxBackups <= 0 {
+		cfg.LogMaxBackups = 14
+	}
+	if cfg.LogMaxAgeDays <= 0 {
+		cfg.LogMaxAgeDays = 14
 	}
 	if cfg.PollIntervalSeconds <= 0 {
 		cfg.PollIntervalSeconds = 60
@@ -250,6 +307,14 @@ func normalizeConfig(cfg *Config) {
 func validateConfig(cfg Config) error {
 	if cfg.DBDSN == "" {
 		return errors.New("postgres dsn is required")
+	}
+	if strings.EqualFold(cfg.MasterKey, "change-me") {
+		return errors.New("master_key must not use the default value")
+	}
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "warning", "error":
+	default:
+		return errors.New("log_level must be one of debug, info, warn, or error")
 	}
 	if cfg.AlertWebhookURL != "" && cfg.MasterKey == "" {
 		return errors.New("master_key is required when alert webhook is configured")

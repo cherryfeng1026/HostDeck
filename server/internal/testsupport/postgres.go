@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+
 	"hostdeck/server/internal/storage"
 )
 
@@ -25,9 +27,13 @@ func OpenPostgresTestDB(t *testing.T) *sql.DB {
 	}
 
 	ctx := context.Background()
-	adminDB, err := storage.Open(ctx, dsn)
+	adminDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open admin postgres db: %v", err)
+	}
+	if err := adminDB.PingContext(ctx); err != nil {
+		_ = adminDB.Close()
+		t.Fatalf("ping admin postgres db: %v", err)
 	}
 
 	schemaName := fmt.Sprintf("hostdeck_test_%d", time.Now().UTC().UnixNano())

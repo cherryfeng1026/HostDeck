@@ -1,8 +1,8 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -22,11 +22,14 @@ type CommandHandler struct {
 
 func (h *CommandHandler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 	user, _ := authctx.CurrentUser(r.Context())
+	slog.Info("command templates list started", "username", user.Username)
 	items, err := h.service.ListTemplates(r.Context(), user.Username)
 	if err != nil {
+		slog.Error("command templates list failed", "username", user.Username, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("查询命令模板失败"))
 		return
 	}
+	slog.Info("command templates list succeeded", "username", user.Username, "count", len(items))
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
@@ -39,12 +42,12 @@ type commandTemplateVariablePayload struct {
 }
 
 type commandTemplateCreatePayload struct {
-	Name        string                               `json:"name"`
-	Description string                               `json:"description"`
-	Command     string                               `json:"command"`
-	Scope       string                               `json:"scope"`
-	RiskLevel   string                               `json:"riskLevel"`
-	Variables   []commandTemplateVariablePayload     `json:"variables"`
+	Name        string                           `json:"name"`
+	Description string                           `json:"description"`
+	Command     string                           `json:"command"`
+	Scope       string                           `json:"scope"`
+	RiskLevel   string                           `json:"riskLevel"`
+	Variables   []commandTemplateVariablePayload `json:"variables"`
 }
 
 type commandTemplateFavoritePayload struct {
@@ -72,13 +75,26 @@ type commandExecutePayload struct {
 	Command        string `json:"command"`
 	TimeoutSeconds int    `json:"timeoutSeconds"`
 	Source         string `json:"source"`
+	TemplateID     string `json:"templateId"`
+	RiskLevel      string `json:"riskLevel"`
+	RiskConfirmed  bool   `json:"riskConfirmed"`
 }
 
 type batchCommandExecutePayload struct {
 	ServerIDs      []int64 `json:"serverIds"`
 	Command        string  `json:"command"`
 	TimeoutSeconds int     `json:"timeoutSeconds"`
+	Source         string  `json:"source"`
+	TemplateID     string  `json:"templateId"`
+	RiskLevel      string  `json:"riskLevel"`
+	RiskConfirmed  bool    `json:"riskConfirmed"`
 }
+
+const (
+	defaultCommandTimeoutSeconds = 15
+	minCommandTimeoutSeconds     = 1
+	maxCommandTimeoutSeconds     = 60
+)
 
 func NewCommandHandler(service *service.CommandService, audit ...AuditEventWriter) *CommandHandler {
 	handler := &CommandHandler{service: service}
@@ -112,11 +128,8 @@ func (h *CommandHandler) CreateTemplate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	defer r.Body.Close()
-	var payload commandTemplateCreatePayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
+	payload, err := decodeJSON[commandTemplateCreatePayload](w, r)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -166,11 +179,8 @@ func (h *CommandHandler) SetTemplateFavorite(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	defer r.Body.Close()
-	var payload commandTemplateFavoritePayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
+	payload, err := decodeJSON[commandTemplateFavoritePayload](w, r)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -213,6 +223,14 @@ func RegisterCommandWriteRoutes(r chi.Router, h *CommandHandler) {
 	}
 
 	RegisterCommandTemplateWriteRoutes(r, h)
+	RegisterCommandExecutionRoutes(r, h)
+}
+
+func RegisterCommandExecutionRoutes(r chi.Router, h *CommandHandler) {
+	if h == nil {
+		return
+	}
+
 	r.Post("/api/servers/{id}/commands/execute", h.Execute)
 	r.Post("/api/commands/execute", h.ExecuteBatch)
 }
@@ -225,14 +243,17 @@ func RegisterCommandRoutes(r chi.Router, h *CommandHandler) {
 func (h *CommandHandler) ListHistory(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	filter := domain.CommandHistoryFilter{}
+	user, _ := authctx.CurrentUser(r.Context())
 
 	if limit := strings.TrimSpace(query.Get("limit")); limit != "" {
 		value, err := strconv.Atoi(limit)
 		if err != nil {
+			slog.Warn("command history list rejected", "username", user.Username, "limit", limit, "error", err)
 			writeError(w, http.StatusBadRequest, errors.New("limit 参数无效"))
 			return
 		}
 		if value <= 0 {
+			slog.Warn("command history list rejected", "username", user.Username, "limit", value, "reason", "non_positive_limit")
 			writeError(w, http.StatusBadRequest, errors.New("limit 必须大于 0"))
 			return
 		}
@@ -241,6 +262,7 @@ func (h *CommandHandler) ListHistory(w http.ResponseWriter, r *http.Request) {
 	if serverID := strings.TrimSpace(query.Get("serverId")); serverID != "" {
 		value, err := strconv.ParseInt(serverID, 10, 64)
 		if err != nil {
+			slog.Warn("command history list rejected", "username", user.Username, "server_id", serverID, "error", err)
 			writeError(w, http.StatusBadRequest, errors.New("serverId 参数无效"))
 			return
 		}
@@ -255,6 +277,7 @@ func (h *CommandHandler) ListHistory(w http.ResponseWriter, r *http.Request) {
 	if start := strings.TrimSpace(query.Get("startTime")); start != "" {
 		value, err := time.Parse(time.RFC3339, start)
 		if err != nil {
+			slog.Warn("command history list rejected", "username", user.Username, "start_time", start, "error", err)
 			writeError(w, http.StatusBadRequest, errors.New("startTime 参数无效"))
 			return
 		}
@@ -263,44 +286,104 @@ func (h *CommandHandler) ListHistory(w http.ResponseWriter, r *http.Request) {
 	if end := strings.TrimSpace(query.Get("endTime")); end != "" {
 		value, err := time.Parse(time.RFC3339, end)
 		if err != nil {
+			slog.Warn("command history list rejected", "username", user.Username, "end_time", end, "error", err)
 			writeError(w, http.StatusBadRequest, errors.New("endTime 参数无效"))
 			return
 		}
 		filter.EndTime = &value
 	}
 	if filter.StartTime != nil && filter.EndTime != nil && filter.EndTime.Before(*filter.StartTime) {
+		slog.Warn(
+			"command history list rejected",
+			"username", user.Username,
+			"start_time", filter.StartTime.Format(time.RFC3339),
+			"end_time", filter.EndTime.Format(time.RFC3339),
+			"reason", "end_before_start",
+		)
 		writeError(w, http.StatusBadRequest, errors.New("endTime 必须晚于或等于 startTime"))
 		return
 	}
 
+	slog.Info(
+		"command history list started",
+		"username", user.Username,
+		"limit", filter.Limit,
+		"server_id", filter.ServerID,
+		"executor_username", filter.ExecutorUsername,
+		"keyword", filter.Keyword,
+		"start_time", formatOptionalTime(filter.StartTime),
+		"end_time", formatOptionalTime(filter.EndTime),
+	)
 	items, err := h.service.ListHistory(r.Context(), filter)
 	if err != nil {
+		slog.Error(
+			"command history list failed",
+			"username", user.Username,
+			"limit", filter.Limit,
+			"server_id", filter.ServerID,
+			"executor_username", filter.ExecutorUsername,
+			"keyword", filter.Keyword,
+			"error", err,
+		)
 		writeError(w, http.StatusInternalServerError, errors.New("查询命令历史失败"))
 		return
 	}
+	slog.Info("command history list succeeded", "username", user.Username, "count", len(items), "server_id", filter.ServerID)
 	writeJSON(w, http.StatusOK, items)
 }
 
 func (h *CommandHandler) Execute(w http.ResponseWriter, r *http.Request) {
 	id, err := parseServerID(r)
 	if err != nil {
+		slog.Warn("command execute rejected", "server_id", chi.URLParam(r, "id"), "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	defer r.Body.Close()
-	var payload commandExecutePayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
+	payload, err := decodeJSON[commandExecutePayload](w, r)
+	if err != nil {
+		slog.Warn("command execute rejected", "server_id", id, "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	timeout, err := commandTimeout(payload.TimeoutSeconds)
+	if err != nil {
+		slog.Warn("command execute rejected", "server_id", id, "timeout_seconds", payload.TimeoutSeconds, "error", err)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	timeoutSeconds := int(timeout / time.Second)
 
 	user, _ := authctx.CurrentUser(r.Context())
-	timeout := time.Duration(payload.TimeoutSeconds) * time.Second
-	result, err := h.service.ExecuteWithExecutor(r.Context(), id, payload.Command, timeout, user.Username)
+	slog.Info(
+		"command execute started",
+		"username", user.Username,
+		"server_id", id,
+		"timeout_seconds", timeoutSeconds,
+		"source", strings.TrimSpace(payload.Source),
+		"command_length", len(strings.TrimSpace(payload.Command)),
+	)
+	result, err := h.service.ExecuteCommand(r.Context(), domain.CommandExecutionInput{
+		ServerID:           id,
+		Command:            payload.Command,
+		Timeout:            timeout,
+		Source:             payload.Source,
+		TemplateID:         payload.TemplateID,
+		RiskLevel:          payload.RiskLevel,
+		RiskConfirmed:      payload.RiskConfirmed,
+		ExecutorUsername:   user.Username,
+		ExecutorAuthMethod: string(currentAuthMethod(r)),
+		RequestID:          requestID(r),
+	})
 	if err != nil {
+		slog.Warn(
+			"command execute failed",
+			"username", user.Username,
+			"server_id", id,
+			"timeout_seconds", timeoutSeconds,
+			"command_length", len(strings.TrimSpace(payload.Command)),
+			"error", err,
+		)
 		writeCommandError(w, err)
 		return
 	}
@@ -315,23 +398,63 @@ func (h *CommandHandler) Execute(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: result.ExecutedAt,
 		})
 	}
+	slog.Info(
+		"command execute succeeded",
+		"username", user.Username,
+		"server_id", id,
+		"exit_code", result.ExitCode,
+		"duration_ms", result.DurationMS,
+		"stdout_length", len(result.Stdout),
+		"stderr_length", len(result.Stderr),
+		"executed_at", result.ExecutedAt,
+	)
 	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *CommandHandler) ExecuteBatch(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	var payload batchCommandExecutePayload
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
+	payload, err := decodeJSON[batchCommandExecutePayload](w, r)
+	if err != nil {
+		slog.Warn("batch command execute rejected", "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	timeout, err := commandTimeout(payload.TimeoutSeconds)
+	if err != nil {
+		slog.Warn("batch command execute rejected", "timeout_seconds", payload.TimeoutSeconds, "error", err)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	timeoutSeconds := int(timeout / time.Second)
 
 	user, _ := authctx.CurrentUser(r.Context())
-	timeout := time.Duration(payload.TimeoutSeconds) * time.Second
-	results, err := h.service.ExecuteBatchWithExecutor(r.Context(), payload.ServerIDs, payload.Command, timeout, user.Username)
+	slog.Info(
+		"batch command execute started",
+		"username", user.Username,
+		"server_count", len(payload.ServerIDs),
+		"timeout_seconds", timeoutSeconds,
+		"command_length", len(strings.TrimSpace(payload.Command)),
+	)
+	results, err := h.service.ExecuteBatchWithInput(r.Context(), domain.CommandExecutionInput{
+		ServerIDs:          payload.ServerIDs,
+		Command:            payload.Command,
+		Timeout:            timeout,
+		Source:             payload.Source,
+		TemplateID:         payload.TemplateID,
+		RiskLevel:          payload.RiskLevel,
+		RiskConfirmed:      payload.RiskConfirmed,
+		ExecutorUsername:   user.Username,
+		ExecutorAuthMethod: string(currentAuthMethod(r)),
+		RequestID:          requestID(r),
+	})
 	if err != nil {
+		slog.Warn(
+			"batch command execute failed",
+			"username", user.Username,
+			"server_count", len(payload.ServerIDs),
+			"timeout_seconds", timeoutSeconds,
+			"command_length", len(strings.TrimSpace(payload.Command)),
+			"error", err,
+		)
 		writeCommandError(w, err)
 		return
 	}
@@ -352,9 +475,60 @@ func (h *CommandHandler) ExecuteBatch(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+	successCount, failureCount := summarizeBatchResults(results)
+	slog.Info(
+		"batch command execute succeeded",
+		"username", user.Username,
+		"server_count", len(payload.ServerIDs),
+		"result_count", len(results),
+		"success_count", successCount,
+		"failure_count", failureCount,
+	)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"results": results,
 	})
+}
+
+func currentAuthMethod(r *http.Request) authctx.AuthMethod {
+	method, ok := authctx.CurrentAuthMethod(r.Context())
+	if !ok {
+		return authctx.AuthMethodSession
+	}
+	return method
+}
+
+func requestID(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-Request-ID"))
+}
+
+func commandTimeout(seconds int) (time.Duration, error) {
+	if seconds == 0 {
+		seconds = defaultCommandTimeoutSeconds
+	}
+	if seconds < minCommandTimeoutSeconds || seconds > maxCommandTimeoutSeconds {
+		return 0, errors.New("timeoutSeconds 必须在 1 到 60 秒之间")
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+func formatOptionalTime(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.Format(time.RFC3339)
+}
+
+func summarizeBatchResults(results []service.BatchCommandResult) (int, int) {
+	successCount := 0
+	failureCount := 0
+	for _, item := range results {
+		if item.Success {
+			successCount++
+			continue
+		}
+		failureCount++
+	}
+	return successCount, failureCount
 }
 
 func commandTitle(exitCode int) string {
@@ -401,8 +575,29 @@ func writeCommandError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	if errors.Is(err, service.ErrServerPasswordNotConfigured) {
+	if errors.Is(err, service.ErrServerCredentialNotConfigured) {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if errors.Is(err, service.ErrCommandRiskConfirmationRequired) {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	if errors.Is(err, service.ErrCommandTemplateMismatch) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if errors.Is(err, storage.ErrCommandTemplateNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if errors.Is(err, storage.ErrCommandTemplateAccessDenied) {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	var executionErr service.CommandExecutionError
+	if errors.As(err, &executionErr) {
+		writeError(w, http.StatusBadGateway, executionErr)
 		return
 	}
 	writeError(w, http.StatusInternalServerError, errors.New("解析服务器失败"))
