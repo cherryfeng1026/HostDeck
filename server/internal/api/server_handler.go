@@ -1,0 +1,389 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"hostdeck/server/internal/authctx"
+	"hostdeck/server/internal/domain"
+	"hostdeck/server/internal/service"
+	"hostdeck/server/internal/storage"
+)
+
+type ServerStore interface {
+	Create(ctx context.Context, item domain.Server) error
+	List(ctx context.Context, filter storage.ServerFilter) ([]domain.Server, error)
+	Update(ctx context.Context, item domain.Server) error
+	Delete(ctx context.Context, id int64) error
+}
+
+type LiveServerLister interface {
+	ListLive(ctx context.Context, filter storage.ServerFilter) ([]service.LiveServerItem, error)
+}
+
+type AuditEventWriter interface {
+	Create(ctx context.Context, event domain.AuditEvent) error
+}
+
+type ServerHandler struct {
+	store      ServerStore
+	liveLister LiveServerLister
+	audit      AuditEventWriter
+}
+
+type serverPayload struct {
+	Name                      string   `json:"name"`
+	Hostname                  string   `json:"hostname"`
+	IP                        string   `json:"ip"`
+	SSHPort                   int      `json:"sshPort"`
+	Username                  string   `json:"username"`
+	AuthType                  string   `json:"authType"`
+	Password                  string   `json:"password"`
+	PrivateKey                string   `json:"privateKey"`
+	TrustedHostKeyFingerprint string   `json:"trustedHostKeyFingerprint"`
+	CollectorMode             string   `json:"collectorMode"`
+	Tags                      []string `json:"tags"`
+	Purpose                   string   `json:"purpose"`
+	Remark                    string   `json:"remark"`
+	ExpiresAt                 string   `json:"expiresAt"`
+	MaintenanceStartAt        string   `json:"maintenanceStartAt"`
+	MaintenanceEndAt          string   `json:"maintenanceEndAt"`
+	Enabled                   *bool    `json:"enabled"`
+}
+
+func NewServerHandler(store ServerStore, liveLister LiveServerLister, audit ...AuditEventWriter) *ServerHandler {
+	handler := &ServerHandler{store: store, liveLister: liveLister}
+	if len(audit) > 0 {
+		handler.audit = audit[0]
+	}
+	return handler
+}
+
+func RegisterServerReadRoutes(r chi.Router, h *ServerHandler) {
+	if h == nil {
+		return
+	}
+
+	r.Get("/api/servers", h.List)
+}
+
+func RegisterServerWriteRoutes(r chi.Router, h *ServerHandler) {
+	if h == nil {
+		return
+	}
+
+	r.Post("/api/servers", h.Create)
+	r.Put("/api/servers/{id}", h.Update)
+	r.Delete("/api/servers/{id}", h.Delete)
+}
+
+func RegisterServerRoutes(r chi.Router, h *ServerHandler) {
+	RegisterServerReadRoutes(r, h)
+	RegisterServerWriteRoutes(r, h)
+}
+
+func (h *ServerHandler) List(w http.ResponseWriter, r *http.Request) {
+	collectorMode := strings.TrimSpace(r.URL.Query().Get("collectorMode"))
+	if collectorMode != "" {
+		collectorMode = domain.NormalizeCollectorMode(collectorMode)
+	}
+
+	filter := storage.ServerFilter{
+		Keyword:       r.URL.Query().Get("keyword"),
+		Tag:           r.URL.Query().Get("tag"),
+		CollectorMode: collectorMode,
+	}
+	if r.URL.Query().Get("includeStatus") == "1" {
+		if h.liveLister == nil {
+			writeError(w, http.StatusInternalServerError, errors.New("服务器实时列表服务未配置"))
+			return
+		}
+		items, err := h.liveLister.ListLive(r.Context(), filter)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+		return
+	}
+
+	items, err := h.store.List(r.Context(), filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (h *ServerHandler) Create(w http.ResponseWriter, r *http.Request) {
+	item, err := decodeServerPayload(w, r, 0)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := h.store.Create(r.Context(), item); err != nil {
+		writeServerStoreError(w, err)
+		return
+	}
+	if h.audit != nil {
+		user, _ := authctx.CurrentUser(r.Context())
+		_ = h.audit.Create(r.Context(), domain.AuditEvent{
+			Kind:       domain.AuditKindServer,
+			Severity:   "info",
+			Title:      "新增服务器",
+			Summary:    item.Name + " · " + item.IP,
+			ServerName: item.Name,
+			Username:   user.Username,
+			CreatedAt:  time.Now().UTC(),
+		})
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (h *ServerHandler) Update(w http.ResponseWriter, r *http.Request) {
+	id, err := parseServerID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	item, err := decodeServerPayload(w, r, id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := h.store.Update(r.Context(), item); err != nil {
+		writeServerStoreError(w, err)
+		return
+	}
+	if h.audit != nil {
+		user, _ := authctx.CurrentUser(r.Context())
+		_ = h.audit.Create(r.Context(), domain.AuditEvent{
+			Kind:       domain.AuditKindServer,
+			Severity:   "info",
+			Title:      "更新服务器",
+			Summary:    item.Name + " · " + item.IP,
+			ServerID:   item.ID,
+			ServerName: item.Name,
+			Username:   user.Username,
+			CreatedAt:  time.Now().UTC(),
+		})
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *ServerHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	id, err := parseServerID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := h.store.Delete(r.Context(), id); err != nil {
+		writeServerStoreError(w, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeServerPayload(w http.ResponseWriter, r *http.Request, id int64) (domain.Server, error) {
+	payload, err := decodeJSON[serverPayload](w, r)
+	if err != nil {
+		return domain.Server{}, err
+	}
+	return payload.toDomain(id)
+}
+
+func (p serverPayload) toDomain(id int64) (domain.Server, error) {
+	name := strings.TrimSpace(p.Name)
+	if name == "" {
+		return domain.Server{}, errors.New("服务器名称不能为空")
+	}
+
+	hostname := strings.TrimSpace(p.Hostname)
+	if hostname == "" {
+		return domain.Server{}, errors.New("主机名不能为空")
+	}
+
+	ip := strings.TrimSpace(p.IP)
+	if ip == "" {
+		return domain.Server{}, errors.New("IP 地址不能为空")
+	}
+
+	username := strings.TrimSpace(p.Username)
+	if username == "" {
+		return domain.Server{}, errors.New("用户名不能为空")
+	}
+
+	enabled := true
+	if p.Enabled != nil {
+		enabled = *p.Enabled
+	}
+
+	sshPort := p.SSHPort
+	if sshPort == 0 {
+		sshPort = 22
+	}
+
+	authType, err := normalizeServerAuthType(p.AuthType)
+	if err != nil {
+		return domain.Server{}, err
+	}
+	password := strings.TrimSpace(p.Password)
+	if authType == "password" && id == 0 && password == "" {
+		return domain.Server{}, errors.New("SSH 密码不能为空")
+	}
+	privateKey := strings.TrimSpace(p.PrivateKey)
+	if authType == "private_key" && id == 0 && privateKey == "" {
+		return domain.Server{}, errors.New("SSH 私钥不能为空")
+	}
+
+	collectorMode := domain.NormalizeCollectorMode(p.CollectorMode)
+	expiresAt, err := parseOptionalRFC3339(p.ExpiresAt, "过期时间格式无效")
+	if err != nil {
+		return domain.Server{}, err
+	}
+	maintenanceStartAt, maintenanceEndAt, err := parseMaintenanceWindow(p.MaintenanceStartAt, p.MaintenanceEndAt)
+	if err != nil {
+		return domain.Server{}, err
+	}
+
+	tags := p.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+
+	return domain.Server{
+		ID:                        id,
+		Name:                      name,
+		Hostname:                  hostname,
+		IP:                        ip,
+		SSHPort:                   sshPort,
+		Username:                  username,
+		AuthType:                  authType,
+		Password:                  password,
+		PrivateKey:                privateKey,
+		TrustedHostKeyFingerprint: strings.TrimSpace(p.TrustedHostKeyFingerprint),
+		CollectorMode:             collectorMode,
+		Tags:                      tags,
+		Purpose:                   strings.TrimSpace(p.Purpose),
+		Remark:                    strings.TrimSpace(p.Remark),
+		ExpiresAt:                 expiresAt,
+		MaintenanceStartAt:        maintenanceStartAt,
+		MaintenanceEndAt:          maintenanceEndAt,
+		Enabled:                   enabled,
+	}, nil
+}
+
+func normalizeServerAuthType(value string) (string, error) {
+	switch strings.TrimSpace(value) {
+	case "", "password":
+		return "password", nil
+	case "private_key", "key":
+		return "private_key", nil
+	default:
+		return "", errors.New("SSH 连接方式无效")
+	}
+}
+
+func parseServerID(r *http.Request) (int64, error) {
+	return strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+}
+
+func parseMaintenanceWindow(startRaw string, endRaw string) (*time.Time, *time.Time, error) {
+	startRaw = strings.TrimSpace(startRaw)
+	endRaw = strings.TrimSpace(endRaw)
+	if startRaw == "" && endRaw == "" {
+		return nil, nil, nil
+	}
+	if startRaw == "" || endRaw == "" {
+		return nil, nil, errors.New("维护时间窗必须同时提供开始和结束时间")
+	}
+	startAt, err := time.Parse(time.RFC3339, startRaw)
+	if err != nil {
+		return nil, nil, errors.New("维护开始时间格式无效")
+	}
+	endAt, err := time.Parse(time.RFC3339, endRaw)
+	if err != nil {
+		return nil, nil, errors.New("维护结束时间格式无效")
+	}
+	if !endAt.After(startAt) {
+		return nil, nil, errors.New("维护结束时间必须晚于开始时间")
+	}
+	startAt = startAt.UTC()
+	endAt = endAt.UTC()
+	return &startAt, &endAt, nil
+}
+
+func parseOptionalRFC3339(raw string, errorMessage string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, errors.New(errorMessage)
+	}
+	parsed = parsed.UTC()
+	return &parsed, nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	msg := err.Error()
+	// 5xx 错误脱敏：不向客户端泄露内部错误细节
+	if status >= 500 {
+		msg = "内部服务器错误"
+	}
+	writeJSON(w, status, map[string]string{
+		"error": msg,
+	})
+}
+
+const defaultMaxBodyBytes = 128 * 1024
+
+func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, error) {
+	defer r.Body.Close()
+
+	var v T
+	r.Body = http.MaxBytesReader(w, r.Body, defaultMaxBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&v); err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+func writeServerStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, storage.ErrServerIPConflict) {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	if errors.Is(err, storage.ErrServerNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if errors.Is(err, storage.ErrServerCredentialRequired) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err)
+}
