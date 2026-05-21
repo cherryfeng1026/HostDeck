@@ -110,6 +110,8 @@ docker compose up -d --build
 
 容器会读取挂载的 `./server/config/config.yaml`，并把应用日志写入 `./logs/hostdeck/hostdeck.log`；日志由 Go 程序按大小、数量和保留天数自动轮转。Linux 服务器上建议先执行 `sudo chown -R 10001:10001 logs/hostdeck`。
 
+默认 Compose 只把 `18080` 绑定到本机 `127.0.0.1`。生产环境建议使用独立的公共反向代理统一占用 `80/443`，再按域名转发到 HostDeck 容器，避免多个项目各自绑定公网端口。
+
 ## 验证
 
 ```powershell

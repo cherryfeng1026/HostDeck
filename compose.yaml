@@ -7,7 +7,7 @@ services:
     image: hostdeck:local
     restart: unless-stopped
     ports:
-      - "18080:18080"
+      - "127.0.0.1:18080:18080"
     volumes:
       - ./server/config/config.yaml:/app/config.yaml:ro
       - ./logs/hostdeck:/app/logs
